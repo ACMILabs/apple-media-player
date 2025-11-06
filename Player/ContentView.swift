@@ -5,84 +5,921 @@
 //  Created by Simon Loffler on 30/10/2025.
 //
 
+// SwiftUI XOS Media Player
+// macOS + tvOS single-file app with simple, readable code
+// - Fullscreen looping playback of a playlist
+// - Tap/click anywhere to open a settings sheet to change playlist ID and clear cache
+// - Caches playlist JSON and video files; prefers cached media
+// - Shows a loading image while preparing, and a no‑internet image if nothing cached
+
 import SwiftUI
-import CoreData
+import AVKit
+import Combine
 
-struct ContentView: View {
-    @Environment(\.managedObjectContext) private var viewContext
+// MARK: - Models
 
-    @FetchRequest(
-        sortDescriptors: [NSSortDescriptor(keyPath: \Item.timestamp, ascending: true)],
-        animation: .default)
-    private var items: FetchedResults<Item>
+struct XOSPlaylistResponse: Codable {
+    struct PlaylistLabel: Codable {
+        struct Label: Codable { let id: Int? }
+        let label: Label?
+        let resource: String?
+        let subtitles: String?
+    }
+    let playlist_labels: [PlaylistLabel]
+}
+
+struct CachedPlaylist: Codable {
+    let fetchedAt: Date
+    let playlist: XOSPlaylistResponse
+}
+
+// MARK: - Platform Helpers
+
+#if os(macOS)
+import AppKit
+#endif
+
+// MARK: - View Model
+
+@MainActor
+final class MediaPlayerViewModel: ObservableObject {
+
+    // MARK: Public UI State
+    @Published var isShowingSettingsSheet: Bool = false
+    @Published var isLoadingPlaylistAndVideos: Bool = true
+    @Published var isOfflineWithNoCachedData: Bool = false
+    @Published var userEditablePlaylistIdentifier: String = UserDefaults.standard.string(forKey: "xos.playlist.id") ?? "1"
+    @Published var avQueuePlayer: AVQueuePlayer = AVQueuePlayer()
+
+    // MARK: Subtitles + Sync Settings (moved from extension)
+    @Published var showSubtitlesIfAvailable: Bool = UserDefaults.standard.object(forKey: "xos.subtitles.show") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showSubtitlesIfAvailable, forKey: "xos.subtitles.show") }
+    }
+    @Published var subtitleFontPointSize: CGFloat = CGFloat(UserDefaults.standard.object(forKey: "xos.subtitles.fontSize") as? Int ?? 28) {
+        didSet { UserDefaults.standard.set(Int(subtitleFontPointSize), forKey: "xos.subtitles.fontSize") }
+    }
+    @Published var subtitleIsBold: Bool = UserDefaults.standard.object(forKey: "xos.subtitles.bold") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(subtitleIsBold, forKey: "xos.subtitles.bold") }
+    }
+
+    @Published var isThisDeviceTheSyncServer: Bool = UserDefaults.standard.object(forKey: "xos.sync.isServer") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(isThisDeviceTheSyncServer, forKey: "xos.sync.isServer"); setupSyncNetworkingIfConfigured() }
+    }
+    @Published var syncServerHostnameOrIpAddress: String = UserDefaults.standard.string(forKey: "xos.sync.serverHost") ?? "" {
+        didSet { UserDefaults.standard.set(syncServerHostnameOrIpAddress, forKey: "xos.sync.serverHost"); setupSyncNetworkingIfConfigured() }
+    }
+    @Published var syncListeningPortNumber: UInt16 = UInt16(UserDefaults.standard.integer(forKey: "xos.sync.port")) == 0 ? 10000 : UInt16(exactly: UserDefaults.standard.integer(forKey: "xos.sync.port"))! {
+        didSet { UserDefaults.standard.set(Int(syncListeningPortNumber), forKey: "xos.sync.port"); setupSyncNetworkingIfConfigured() }
+    }
+    @Published var syncDriftThresholdMilliseconds: Int = {
+        let v = UserDefaults.standard.integer(forKey: "xos.sync.driftThresholdMs"); return v == 0 ? 40 : v
+    }() {
+        didSet { UserDefaults.standard.set(syncDriftThresholdMilliseconds, forKey: "xos.sync.driftThresholdMs") }
+    }
+    @Published var syncLatencyMilliseconds: Int = {
+        let v = UserDefaults.standard.integer(forKey: "xos.sync.latencyMs"); return v == 0 ? 30 : v
+    }() {
+        didSet { UserDefaults.standard.set(syncLatencyMilliseconds, forKey: "xos.sync.latencyMs") }
+    }
+    @Published var syncIgnoreThresholdMilliseconds: Int = {
+        let v = UserDefaults.standard.integer(forKey: "xos.sync.ignoreThresholdMs"); return v == 0 ? 2000 : v
+    }() {
+        didSet { UserDefaults.standard.set(syncIgnoreThresholdMilliseconds, forKey: "xos.sync.ignoreThresholdMs") }
+    }
+
+    @Published var currentlyVisibleSubtitleText: String = ""
+
+    // Subtitle parsing cache
+    private var subtitleCuesByLocalVideoURL: [URL: [SubtitleCue]] = [:]
+
+    // Sync internals
+    private var syncServer: SimpleSyncServer?
+    private var syncClient: SimpleSyncClient?
+    private var serverTicker: Timer?
+    private var playerTimeObserverToken: Any?
+    private var syncLockedIndex: Int? = nil
+
+    // MARK: Configuration
+    private let xosApiEndpointBase: String = "https://xos.acmi.net.au/api/"
+    private var xosPlaylistEndpoint: String { xosApiEndpointBase.hasSuffix("/") ? xosApiEndpointBase + "playlists/" : xosApiEndpointBase + "/playlists/" }
+
+    // MARK: Public API
+    func onAppearStartPlayback() {
+        Task { await loadPlaylistAndPreparePlaybackThenStart() }
+        setupPeriodicPlayerTimeObserverForSubtitles()
+        setupSyncNetworkingIfConfigured()
+    }
+
+    func toggleSettingsSheet() { isShowingSettingsSheet.toggle() }
+
+    func saveSettingsAndReload() {
+        UserDefaults.standard.set(userEditablePlaylistIdentifier, forKey: "xos.playlist.id")
+        Task { await loadPlaylistAndPreparePlaybackThenStart() }
+    }
+
+    func clearAllCachedData() {
+        do {
+            try FileManager.default.removeItem(at: cacheDirectory())
+        } catch { /* ignore if nothing to remove */ }
+        Task { await loadPlaylistAndPreparePlaybackThenStart() }
+    }
+
+    // MARK: Loading + Caching
+    private func loadPlaylistAndPreparePlaybackThenStart() async {
+        isLoadingPlaylistAndVideos = true
+        isOfflineWithNoCachedData = false
+        removePlaybackObserversAndStop()
+
+        let playlistId = userEditablePlaylistIdentifier
+        do {
+            let playlistResponse = try await fetchPlaylistPreferCache(playlistIdentifier: playlistId)
+            let playerItems = try await prepareLocalPlayerItemsFrom(playlistResponse: playlistResponse)
+            await configurePlayerQueueWith(itemsToPlayInOrder: playerItems)
+            avQueuePlayer.play()
+            isLoadingPlaylistAndVideos = false
+        } catch FetchError.noInternetAndNoCache {
+            isOfflineWithNoCachedData = true
+            isLoadingPlaylistAndVideos = false
+        } catch {
+            // If something else failed, try showing cached playlist if available
+            if let cached = try? loadCachedPlaylist(playlistIdentifier: playlistId) {
+                do {
+                    let playerItems = try await prepareLocalPlayerItemsFrom(playlistResponse: cached.playlist)
+                    await configurePlayerQueueWith(itemsToPlayInOrder: playerItems)
+                    avQueuePlayer.play()
+                    isLoadingPlaylistAndVideos = false
+                } catch {
+                    isOfflineWithNoCachedData = true
+                    isLoadingPlaylistAndVideos = false
+                }
+            } else {
+                isOfflineWithNoCachedData = true
+                isLoadingPlaylistAndVideos = false
+            }
+        }
+    }
+
+    private enum FetchError: Error { case noInternetAndNoCache }
+
+    private func fetchPlaylistPreferCache(playlistIdentifier: String) async throws -> XOSPlaylistResponse {
+        // Try network first; on failure, fall back to cache; if no cache, throw
+        if let networkPlaylist = try? await fetchPlaylistFromNetwork(playlistIdentifier: playlistIdentifier) {
+            try savePlaylistToCache(networkPlaylist, playlistIdentifier: playlistIdentifier)
+            return networkPlaylist
+        }
+        if let cached = try? loadCachedPlaylist(playlistIdentifier: playlistIdentifier) {
+            return cached.playlist
+        }
+        throw FetchError.noInternetAndNoCache
+    }
+
+    private func fetchPlaylistFromNetwork(playlistIdentifier: String) async throws -> XOSPlaylistResponse {
+        let urlString = xosPlaylistEndpoint + "\(playlistIdentifier)/"
+        guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+
+        var urlRequest = URLRequest(url: url)
+        urlRequest.timeoutInterval = 8
+
+        let (data, response) = try await URLSession.shared.data(for: urlRequest)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return try JSONDecoder().decode(XOSPlaylistResponse.self, from: data)
+    }
+
+    private func cacheDirectory() -> URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let appDir = base.appendingPathComponent("XOSMediaCache", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: appDir.path) {
+            try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        }
+        return appDir
+    }
+
+    private func playlistDirectory(playlistIdentifier: String) -> URL {
+        let dir = cacheDirectory().appendingPathComponent("playlist_\(playlistIdentifier)", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func playlistJSONPath(playlistIdentifier: String) -> URL {
+        playlistDirectory(playlistIdentifier: playlistIdentifier).appendingPathComponent("playlist.json")
+    }
+
+    private func savePlaylistToCache(_ playlist: XOSPlaylistResponse, playlistIdentifier: String) throws {
+        let cached = CachedPlaylist(fetchedAt: Date(), playlist: playlist)
+        let data = try JSONEncoder().encode(cached)
+        try data.write(to: playlistJSONPath(playlistIdentifier: playlistIdentifier), options: .atomic)
+    }
+
+    private func loadCachedPlaylist(playlistIdentifier: String) throws -> CachedPlaylist {
+        let data = try Data(contentsOf: playlistJSONPath(playlistIdentifier: playlistIdentifier))
+        return try JSONDecoder().decode(CachedPlaylist.self, from: data)
+    }
+
+    private func localFileURLForRemoteResource(_ remoteString: String, playlistIdentifier: String) -> URL {
+        let fileName = URL(string: remoteString)?.lastPathComponent ?? UUID().uuidString
+        return playlistDirectory(playlistIdentifier: playlistIdentifier).appendingPathComponent(fileName)
+    }
+
+    private func ensureFileCached(from remoteString: String, playlistIdentifier: String) async throws -> URL {
+        let localUrl = localFileURLForRemoteResource(remoteString, playlistIdentifier: playlistIdentifier)
+        if FileManager.default.fileExists(atPath: localUrl.path) {
+            return localUrl
+        }
+        guard let remoteUrl = URL(string: remoteString) else { throw URLError(.badURL) }
+        let (tempUrl, response) = try await URLSession.shared.download(from: remoteUrl)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        try FileManager.default.moveItem(at: tempUrl, to: localUrl)
+        return localUrl
+    }
+
+    private func prepareLocalPlayerItemsFrom(playlistResponse: XOSPlaylistResponse) async throws -> [AVPlayerItem] {
+        let playlistId = userEditablePlaylistIdentifier
+        var items: [AVPlayerItem] = []
+        subtitleCuesByLocalVideoURL.removeAll()
+        for label in playlistResponse.playlist_labels {
+            guard let resourceString = label.resource, !resourceString.isEmpty else { continue }
+            do {
+                let localVideoUrl = try await ensureFileCached(from: resourceString, playlistIdentifier: playlistId)
+                if let subtitlesUrlString = label.subtitles, !subtitlesUrlString.isEmpty,
+                   let localSubtitleUrl = try? await ensureFileCached(from: subtitlesUrlString, playlistIdentifier: playlistId),
+                   let data = try? Data(contentsOf: localSubtitleUrl) {
+                    subtitleCuesByLocalVideoURL[localVideoUrl] = WebVTTParser.parseWebVTT(from: data)
+                }
+                let asset = AVURLAsset(url: localVideoUrl)
+                print("Preparing to play: \(localVideoUrl.lastPathComponent)")
+                let item = AVPlayerItem(asset: asset)
+                items.append(item)
+            } catch {
+                continue
+            }
+        }
+        return items
+    }
+
+    // MARK: Player Setup
+    private func configurePlayerQueueWith(itemsToPlayInOrder: [AVPlayerItem]) async {
+        removePlaybackObserversAndStop()
+
+        originalQueueItems = itemsToPlayInOrder
+
+        // Reuse the existing player instance
+        let player = avQueuePlayer
+        player.removeAllItems()
+        player.actionAtItemEnd = .advance
+        itemsToPlayInOrder.forEach { player.insert($0, after: nil) }
+
+        addEndOfQueueObserverToLoop()
+    }
+
+    private func removePlaybackObserversAndStop() {
+        avQueuePlayer.pause()
+        avQueuePlayer.removeAllItems()
+
+        if let token = playerTimeObserverToken {
+            avQueuePlayer.removeTimeObserver(token)
+            playerTimeObserverToken = nil
+        }
+        if let endToken = endOfQueueObserverToken {
+            NotificationCenter.default.removeObserver(endToken)
+            endOfQueueObserverToken = nil
+        }
+        originalQueueItems.removeAll()
+    }
+
+    private func addEndOfQueueObserverToLoop() {
+        endOfQueueObserverToken = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.syncLockedIndex = nil
+
+                // If the item that finished was the last in the queue, rebuild it.
+                let items = self.avQueuePlayer.items()
+                if let finishedItem = self.avQueuePlayer.currentItem, let last = items.last, finishedItem == last {
+                    // iOS
+                    self.rebuildQueueAndPlay()
+                } else if self.avQueuePlayer.items().isEmpty {
+                    // macOS
+                    self.rebuildQueueAndPlay()
+                }
+            }
+        }
+    }
+
+    private func rebuildQueueAndPlay() {
+        let newItems = self.originalQueueItems.map { AVPlayerItem(asset: $0.asset) }
+        newItems.forEach { self.avQueuePlayer.insert($0, after: nil) }
+
+        // If the queue is truly empty (some iOS builds), advance once to load the first item
+        if self.avQueuePlayer.currentItem == nil {
+            self.avQueuePlayer.advanceToNextItem()
+        }
+
+        self.avQueuePlayer.play()
+    }
+
+    // MARK: Subtitles + Sync helpers (moved from extension)
+    private func setupPeriodicPlayerTimeObserverForSubtitles() {
+        if let token = playerTimeObserverToken {
+            avQueuePlayer.removeTimeObserver(token)
+            playerTimeObserverToken = nil
+        }
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        playerTimeObserverToken = avQueuePlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.showSubtitlesIfAvailable else { self.currentlyVisibleSubtitleText = ""; return }
+                guard let currentItem = self.avQueuePlayer.currentItem else { self.currentlyVisibleSubtitleText = ""; return }
+                if let asset = currentItem.asset as? AVURLAsset {
+                    let seconds = CMTimeGetSeconds(time)
+                    let cues = self.subtitleCuesByLocalVideoURL[asset.url] ?? []
+                    if let cue = cues.first(where: { seconds >= $0.start && seconds <= $0.end }) {
+                        self.currentlyVisibleSubtitleText = cue.text
+                    } else {
+                        self.currentlyVisibleSubtitleText = ""
+                    }
+                } else {
+                    self.currentlyVisibleSubtitleText = ""
+                }
+            }
+        }
+    }
+
+    private func setupSyncNetworkingIfConfigured() {
+        // Tear down old things cleanly
+        syncClient?.stop(); syncClient = nil
+        serverTicker?.invalidate(); serverTicker = nil
+        syncServer?.stop(); syncServer = nil
+
+        if isThisDeviceTheSyncServer {
+            guard let server = SimpleSyncServer(port: syncListeningPortNumber) else {
+                // Optional: surface an error state in UI
+                print("Failed to bind UDP listener on port \(syncListeningPortNumber)")
+                return
+            }
+            syncServer = server
+
+            serverTicker = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(handleServerTick), userInfo: nil, repeats: true)
+        } else if !syncServerHostnameOrIpAddress.isEmpty {
+            let client = SimpleSyncClient(serverHost: syncServerHostnameOrIpAddress, port: syncListeningPortNumber)
+            client.onReceiveStateString = { [weak self] state in self?.handleServerSyncMessage(stateString: state) }
+            client.start()
+            syncClient = client
+        }
+    }
+
+    @objc private func handleServerTick() {
+        // This class is @MainActor, so we're on the main actor here.
+        let index = self.currentPlaylistIndex() ?? -1
+        let positionMs = self.avQueuePlayer.currentItem != nil ? Int((self.avQueuePlayer.currentTime().seconds * 1000).rounded()) : 0
+        let state = "\(index),\(positionMs)"
+        print("Sync: \(state)")
+        self.syncServer?.broadcast(stateString: state)
+    }
+
+    private func handleServerSyncMessage(stateString: String) {
+        // Expect "index,positionMs"
+        let parts = stateString.split(separator: ",").map(String.init)
+        guard parts.count == 2,
+              let serverIndex = Int(parts[0]),
+              let serverMs32 = Int(parts[1]) else { return }
+
+        // If we’re locked to this index, don’t even check drift.
+        if let locked = syncLockedIndex, locked == serverIndex {
+            return
+        }
+
+        let now = avQueuePlayer.currentTime()
+        let clientSeconds = now.seconds
+        guard clientSeconds.isFinite, clientSeconds >= 0 else { return }
+        let clientMs = Int64((clientSeconds * 1000.0).rounded())
+        let serverMs = Int64(serverMs32)
+
+        if let clientIndex = currentPlaylistIndex(), clientIndex != serverIndex {
+            // Different item: jump and clear any stale lock
+            syncLockedIndex = nil
+            jumpToPlaylistIndex(serverIndex)
+        }
+
+        let drift = abs(clientMs - serverMs)
+        print("Drift: \(drift) (\(clientMs) - \(serverMs))")
+
+        // If we’re inside threshold, lock for the rest of this track
+        if drift <= Int64(syncDriftThresholdMilliseconds) {
+            syncLockedIndex = serverIndex
+            return
+        }
+
+        // Otherwise, apply correction as before
+        let targetMs = serverMs + Int64(syncLatencyMilliseconds)
+        if let duration = avQueuePlayer.currentItem?.asset.duration, duration.isNumeric {
+            let durationMs = Int64((CMTimeGetSeconds(duration) * 1000.0).rounded())
+            if (durationMs - targetMs) >= Int64(syncIgnoreThresholdMilliseconds),
+               targetMs < durationMs {
+                let newSeconds = Double(targetMs) / 1000.0
+                avQueuePlayer.seek(
+                    to: CMTime(seconds: newSeconds, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+            }
+        }
+    }
+
+    private func currentPlaylistIndex() -> Int? {
+        guard let currentItem = avQueuePlayer.currentItem else { return nil }
+        // Try to identify the current item's asset URL (works for AVURLAsset-backed items)
+        let currentURL: URL? = {
+            if let asset = currentItem.asset as? AVURLAsset { return asset.url }
+            return nil
+        }()
+        // Prefer matching against the original full playlist order so index doesn't reset to 0 as items are popped from the queue.
+        if let currentURL {
+            for (idx, item) in originalQueueItems.enumerated() {
+                if let url = (item.asset as? AVURLAsset)?.url, url == currentURL {
+                    return idx
+                }
+            }
+        }
+        // Fallback: best-effort by finding the current item in the remaining queue
+        let remainingItems = avQueuePlayer.items()
+        if let idxInRemaining = remainingItems.firstIndex(of: currentItem) {
+            // Map remaining index to original index by finding the first matching asset in the original list from the start of remaining
+            if let firstRemainingURL = (remainingItems.first?.asset as? AVURLAsset)?.url,
+               let startIndex = originalQueueItems.firstIndex(where: { ( $0.asset as? AVURLAsset)?.url == firstRemainingURL }) {
+                return startIndex + idxInRemaining
+            }
+        }
+        return nil
+    }
+
+    private func jumpToPlaylistIndex(_ index: Int) {
+        syncLockedIndex = nil                           // <— clear lock if we jump
+        let items = avQueuePlayer.items()
+        guard index >= 0 && index < items.count else { return }
+        for _ in 0..<index { avQueuePlayer.advanceToNextItem() }
+    }
+
+    // Internal State
+    private var originalQueueItems: [AVPlayerItem] = []
+    private var endOfQueueObserverToken: Any?
+}
+
+// MARK: - Views
+
+struct MediaPlayerRootView: View {
+    @StateObject private var viewModel = MediaPlayerViewModel()
 
     var body: some View {
-        NavigationView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp!, formatter: itemFormatter)")
-                    } label: {
-                        Text(item.timestamp!, formatter: itemFormatter)
-                    }
-                }
-                .onDelete(perform: deleteItems)
+        ZStack {
+            if viewModel.isLoadingPlaylistAndVideos {
+                loadingStateView
+            } else if viewModel.isOfflineWithNoCachedData {
+                noInternetStateView
+            } else {
+                playerWithOverlays
             }
+        }
+        .task { viewModel.onAppearStartPlayback() }
+        .sheet(isPresented: $viewModel.isShowingSettingsSheet) {
+            SettingsSheetView(
+                playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                onSaveAndReload: { viewModel.saveSettingsAndReload() },
+                onClearCache: { viewModel.clearAllCachedData() },
+                extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
+            )
+            .presentationDetents([.medium, .large])
+        }
+        .modifier(FullscreenWindowModifier())
+    }
+
+    private var loadingStateView: some View {
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(1.6)
+                    .colorInvert()
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { viewModel.toggleSettingsSheet() }
+    }
+
+    private var noInternetStateView: some View {
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                Image(systemName: "wifi.exclamationmark")
+                    .resizable()
+                    .scaledToFit()
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.white)
+                    .colorInvert()
+                    .frame(width: min(proxy.size.width, proxy.size.height) * 0.3,
+                           height: min(proxy.size.width, proxy.size.height) * 0.3)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { viewModel.toggleSettingsSheet() }
+    }
+}
+
+struct SettingsSheetView<ExtraContent: View>: View {
+    @Binding var playlistIdentifier: String
+    var onSaveAndReload: () -> Void
+    var onClearCache: () -> Void
+    var extraContent: () -> ExtraContent
+
+    init(playlistIdentifier: Binding<String>, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
+        self._playlistIdentifier = playlistIdentifier
+        self.onSaveAndReload = onSaveAndReload
+        self.onClearCache = onClearCache
+        self.extraContent = extraContent
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Playlist Settings") {
+                    TextField("Playlist ID", text: $playlistIdentifier)
+                        .autocorrectionDisabled(true)
+                        #if os(iOS)
+                        .autocapitalization(.none)
+                        #endif
+                }
+                Section("Cache") {
+                    Button("Clear Cached Playlist and Videos") { onClearCache() }
+                        .buttonStyle(.borderedProminent)
+                }
+                extraContent()
+            }
+            .navigationTitle("Settings")
             .toolbar {
-#if os(iOS)
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save & Reload") { onSaveAndReload() }
                 }
+            }
+        }
+    }
+}
+
+// MARK: - Fullscreen Window Modifier (macOS)
+
+struct FullscreenWindowModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content
+            .onAppear { makeWindowFullscreen() }
+        #else
+        content // tvOS is fullscreen by default
+        #endif
+    }
+
+    #if os(macOS)
+    private func makeWindowFullscreen() {
+        // Try to enter fullscreen on the key window when available
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NSApp.windows.first?.toggleFullScreen(nil)
+        }
+    }
+    #endif
+}
+
+
+// ------------------------------------------------------------
+// v2: Added multi-device sync (simple UDP) and subtitle handling
+// ------------------------------------------------------------
+
+import Network
+
+// MARK: - Subtitle Model and Parser
+
+struct SubtitleCue: Identifiable { let id = UUID(); let start: Double; let end: Double; let text: String }
+
+enum WebVTTParser {
+    static func parseWebVTT(from data: Data) -> [SubtitleCue] {
+        guard let raw = String(data: data, encoding: .utf8) else { return [] }
+        var cues: [SubtitleCue] = []
+        let lines = raw.components(separatedBy: .newlines)
+        var i = 0
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+            if line.contains("-->"), let cue = parseCue(at: &i, lines: lines) { cues.append(cue) }
+            i += 1
+        }
+        return cues
+    }
+
+    private static func parseCue(at index: inout Int, lines: [String]) -> SubtitleCue? {
+        // Expect time range line at current index
+        let timing = lines[index]
+        let parts = timing.components(separatedBy: "-->")
+        guard parts.count == 2 else { return nil }
+        let start = parseTimestamp(parts[0].trimmingCharacters(in: .whitespaces))
+        let end = parseTimestamp(parts[1].trimmingCharacters(in: .whitespaces))
+        var textLines: [String] = []
+        var j = index + 1
+        while j < lines.count {
+            let t = lines[j]
+            if t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { break }
+            textLines.append(t)
+            j += 1
+        }
+        index = j
+        return SubtitleCue(start: start, end: end, text: textLines.joined(separator: ""))
+    }
+
+    private static func parseTimestamp(_ s: String) -> Double {
+        // Supports "HH:MM:SS.mmm" or "MM:SS.mmm"
+        let comps = s.replacingOccurrences(of: ",", with: ".").components(separatedBy: ":")
+        guard comps.count >= 2 else { return 0 }
+        let last = comps.last ?? "0"
+        let seconds = Double(last) ?? 0
+        let minutes = Double(comps[comps.count - 2]) ?? 0
+        let hours = comps.count == 3 ? Double(comps[0]) ?? 0 : 0
+        return hours * 3600 + minutes * 60 + seconds
+    }
+}
+
+// MARK: - Sync Networking (UDP with NWConnection)
+
+final class SimpleSyncServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "xos.sync.server")
+    private let port: NWEndpoint.Port
+    private var isRunning = false
+
+    // Keep inbound client connections (no extra outbound sockets)
+    private var clientConnections = Set<ObjectIdentifier>()
+    private var connectionsById: [ObjectIdentifier: NWConnection] = [:]
+
+    init?(port: UInt16) {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
+        let params = NWParameters.udp
+        // You can leave this false; it’s not needed anymore
+        // params.allowLocalEndpointReuse = true
+
+        guard let listener = try? NWListener(using: params, on: nwPort) else { return nil }
+        self.listener = listener
+        self.port = nwPort
+
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                let bound = self.listener.port?.rawValue ?? self.port.rawValue
+                print("Server ready on UDP port \(bound)")
+            case .failed(let err):
+                print("Listener failed: \(err)")
+            default:
+                break
+            }
+        }
+
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            let oid = ObjectIdentifier(connection)
+            self.connectionsById[oid] = connection
+            self.clientConnections.insert(oid)
+
+            connection.stateUpdateHandler = { [weak self] st in
+                guard let self else { return }
+                switch st {
+                case .failed, .cancelled:
+                    self.connectionsById[oid]?.cancel()
+                    self.connectionsById[oid] = nil
+                    self.clientConnections.remove(oid)
+                default:
+                    break
+                }
+            }
+
+            // Keep receiving to keep the connection alive (UDP is message-oriented)
+            self.setupReceive(on: connection)
+            connection.start(queue: self.queue)
+        }
+
+        listener.start(queue: queue)
+        isRunning = true
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        listener.cancel()
+        for (_, conn) in connectionsById { conn.cancel() }
+        connectionsById.removeAll()
+        clientConnections.removeAll()
+        isRunning = false
+    }
+
+    private func setupReceive(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] _, _, _, _ in
+            guard let self else { return }
+            // Just loop; we don’t need to discover endpoints anymore
+            self.setupReceive(on: connection)
+        }
+    }
+
+    func broadcast(stateString: String) {
+        let payload = Data(stateString.utf8)
+        for oid in clientConnections {
+            guard let conn = connectionsById[oid] else { continue }
+            conn.send(content: payload, completion: .contentProcessed { _ in })
+        }
+    }
+}
+
+
+final class SimpleSyncClient {
+    private let serverHost: String
+    private let port: UInt16
+    private let queue = DispatchQueue(label: "xos.sync.client")
+    private var connection: NWConnection?
+    var onReceiveStateString: ((String) -> Void)?
+
+    init(serverHost: String, port: UInt16) {
+        self.serverHost = serverHost
+        self.port = port
+    }
+
+    func start() {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+
+        // Force IPv4 by constructing an IPv4Address from the string.
+        // Accept either a dotted-quad ("192.168.1.10") or a hostname you resolve yourself.
+        guard let ipv4 = IPv4Address(serverHost) else {
+            print("SimpleSyncClient: serverHost must be an IPv4 address like 192.168.1.10")
+            return
+        }
+        let host: NWEndpoint.Host = .ipv4(ipv4)
+
+        let params = NWParameters.udp
+        // (Optional) reuse okay if you’re bouncing the client
+        params.allowLocalEndpointReuse = true
+
+        let connection = NWConnection(host: host, port: nwPort, using: params)
+        self.connection = connection
+        connection.stateUpdateHandler = { state in
+            print("Client state: \(state) on port \(self.port)")
+        }
+        connection.start(queue: queue)
+
+        sendHello()
+        receiveLoop()
+    }
+
+    private func sendHello() {
+        connection?.send(content: Data("hello".utf8), completion: .contentProcessed { _ in })
+    }
+
+    private func receiveLoop() {
+        connection?.receiveMessage { [weak self] data, _, _, _ in
+            if let data, let str = String(data: data, encoding: .utf8) {
+                self?.onReceiveStateString?(str)
+            }
+            self?.receiveLoop()
+        }
+    }
+
+    func stop() { connection?.cancel(); connection = nil }
+}
+
+// MARK: - Subtitle Overlay View
+
+struct SubtitleOverlayView: View {
+    let text: String
+    let fontSize: CGFloat
+    let isBold: Bool
+
+    var body: some View {
+        VStack { Spacer() ; subtitleBubble ; Spacer().frame(height: 20) }
+            .padding(.horizontal, 40)
+            .allowsHitTesting(false)
+    }
+
+    private var subtitleBubble: some View {
+        Text(text)
+            .font(isBold ? .system(size: fontSize, weight: .bold) : .system(size: fontSize, weight: .regular))
+            .foregroundStyle(.white)
+            .multilineTextAlignment(.center)
+            .padding(12)
+            .background(.black.opacity(0.6))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .opacity(text.isEmpty ? 0 : 1)
+            .animation(.easeInOut(duration: 0.2), value: text)
+    }
+}
+
+// MARK: - UI wiring updates
+
+extension MediaPlayerRootView {
+    @ViewBuilder
+    var playerWithOverlays: some View {
+        ZStack {
+#if os(macOS)
+            MacVideoSurface(player: viewModel.avQueuePlayer)
+                .ignoresSafeArea()
+#else
+            VideoPlayer(player: viewModel.avQueuePlayer)
+                .ignoresSafeArea()
 #endif
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
-            Text("Select an item")
-        }
-    }
 
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(context: viewContext)
-            newItem.timestamp = Date()
-
-            do {
-                try viewContext.save()
-            } catch {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                let nsError = error as NSError
-                fatalError("Unresolved error \(nsError), \(nsError.userInfo)")
+            if viewModel.showSubtitlesIfAvailable {
+                SubtitleOverlayView(text: viewModel.currentlyVisibleSubtitleText,
+                                    fontSize: viewModel.subtitleFontPointSize,
+                                    isBold: viewModel.subtitleIsBold)
             }
         }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            offsets.map { items[$0] }.forEach(viewContext.delete)
-
-            do {
-                try viewContext.save()
-            } catch {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                let nsError = error as NSError
-                fatalError("Unresolved error \(nsError), \(nsError.userInfo)")
+        .contentShape(Rectangle())
+        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+#if os(macOS)
+        .onKeyPress(.space) {
+            viewModel.toggleSettingsSheet()
+            return .handled
+        }
+        .onKeyPress(.return) {
+            viewModel.toggleSettingsSheet()
+            return .handled
+        }
+        .onKeyPress { press in
+            if press.characters.contains(where: { $0 == "s" || $0 == "S" }) {
+                viewModel.toggleSettingsSheet()
+                return .handled
             }
+            return .ignored
+        }
+#endif
+    }
+}
+
+// Sync + Subtitle controls inside the sheet
+struct SyncAndSubtitleSettings: View {
+    @ObservedObject var viewModel: MediaPlayerViewModel
+    var body: some View {
+        Section("Subtitles") {
+            Toggle("Show subtitles if available", isOn: $viewModel.showSubtitlesIfAvailable)
+            Stepper(value: $viewModel.subtitleFontPointSize, in: 12...72, step: 2) { Text("Font size: \(Int(viewModel.subtitleFontPointSize))") }
+            Toggle("Bold text", isOn: $viewModel.subtitleIsBold)
+        }
+        Section("Multi‑device Sync") {
+            Toggle("This device is the sync server", isOn: $viewModel.isThisDeviceTheSyncServer)
+            TextField("Server hostname/IP (for clients)", text: $viewModel.syncServerHostnameOrIpAddress)
+                .autocorrectionDisabled(true)
+                #if os(iOS)
+                .autocapitalization(.none)
+                #endif
+            Stepper(value: Binding(get: { Int(viewModel.syncListeningPortNumber) }, set: { newVal in
+                let clamped = max(10000, min(10001, newVal))
+                viewModel.syncListeningPortNumber = UInt16(clamped)
+            }), in: 1000...65500, step: 1) { Text("Port: \(viewModel.syncListeningPortNumber)") }
+            Stepper(value: $viewModel.syncDriftThresholdMilliseconds, in: 5...500, step: 5) { Text("Drift threshold (ms): \(viewModel.syncDriftThresholdMilliseconds)") }
+            Stepper(value: $viewModel.syncLatencyMilliseconds, in: 0...500, step: 5) { Text("Sync latency (ms): \(viewModel.syncLatencyMilliseconds)") }
+            Stepper(value: $viewModel.syncIgnoreThresholdMilliseconds, in: 100...10000, step: 100) { Text("Ignore threshold remaining (ms): \(viewModel.syncIgnoreThresholdMilliseconds)") }
+            Text("Clients: set the server hostname/IP and leave ‘This device is the sync server’ OFF. The client will auto‑listen and adjust playback.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 }
 
-private let itemFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .short
-    formatter.timeStyle = .medium
-    return formatter
-}()
 
-#Preview {
-    ContentView().environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
+
+#if os(macOS)
+struct MacVideoSurface: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let v = AVPlayerView()
+        v.controlsStyle = .none
+        v.showsFullScreenToggleButton = false
+        v.updatesNowPlayingInfoCenter = false
+        v.videoGravity = .resizeAspectFill
+        v.player = player
+        return v
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player { nsView.player = player }
+    }
 }
+#endif
+
+// MARK: - Previews
+
+#Preview("Player Preview") {
+    MediaPlayerRootView()
+        .background(Color.black)
+}
+
