@@ -382,7 +382,7 @@ final class MediaPlayerViewModel: ObservableObject {
         let index = self.currentPlaylistIndex() ?? -1
         let positionMs = self.avQueuePlayer.currentItem != nil ? Int((self.avQueuePlayer.currentTime().seconds * 1000).rounded()) : 0
         let state = "\(index),\(positionMs)"
-        print("Sync: \(state)")
+        // print("Sync: \(state)")
         self.syncServer?.broadcast(stateString: state)
     }
 
@@ -505,11 +505,16 @@ struct MediaPlayerRootView: View {
     private var loadingStateView: some View {
         GeometryReader { proxy in
             ZStack {
-                Color.black.ignoresSafeArea()
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .scaleEffect(1.6)
-                    .colorInvert()
+                VStack {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(2)
+                        .colorInvert()
+                        .padding()
+                    Text("Loading...")
+                        .foregroundStyle(.white)
+                }
+                .frame(height: proxy.size.height / 2)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
@@ -519,17 +524,21 @@ struct MediaPlayerRootView: View {
 
     private var noInternetStateView: some View {
         GeometryReader { proxy in
-            ZStack {
-                Color.black.ignoresSafeArea()
-                Image(systemName: "wifi.exclamationmark")
-                    .resizable()
-                    .scaledToFit()
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.white)
-                    .colorInvert()
-                    .frame(width: min(proxy.size.width, proxy.size.height) * 0.3,
-                           height: min(proxy.size.width, proxy.size.height) * 0.3)
+            ZStack() {
+                VStack() {
+                    Image(systemName: "wifi.exclamationmark")
+                        .resizable()
+                        .scaledToFit()
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.white)
+                        .frame(height: proxy.size.height * 0.2)
+                        .padding()
+                    Text("Please connect to ACMI Wi-Fi")
+                        .foregroundStyle(.white)
+                }
+                .frame(height: proxy.size.height / 2)
             }
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .contentShape(Rectangle())
         .onTapGesture { viewModel.toggleSettingsSheet() }
