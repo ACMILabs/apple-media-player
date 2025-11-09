@@ -89,6 +89,29 @@ final class MediaPlayerViewModel: ObservableObject {
 
     @Published var currentlyVisibleSubtitleText: String = ""
 
+    // MQTT message server for label syncing
+    @Published var brokerIsEnabled: Bool = UserDefaults.standard.object(forKey: "xos.broker.enabled") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(brokerIsEnabled, forKey: "xos.broker.enabled"); setupBrokerIfConfigured() }
+    }
+    @Published var brokerURLString: String = UserDefaults.standard.string(forKey: "xos.broker.url") ?? "" {
+        didSet { UserDefaults.standard.set(brokerURLString, forKey: "xos.broker.url"); setupBrokerIfConfigured() }
+    }
+    @Published var brokerClientId: String = UserDefaults.standard.string(forKey: "xos.broker.clientId") ?? "xos-\(UUID().uuidString.prefix(8))" {
+        didSet { UserDefaults.standard.set(brokerClientId, forKey: "xos.broker.clientId"); setupBrokerIfConfigured() }
+    }
+    @Published var mediaPlayerIdentifierForBroker: String = UserDefaults.standard.string(forKey: "xos.mediaplayer.id") ?? "1" {
+        didSet { UserDefaults.standard.set(mediaPlayerIdentifierForBroker, forKey: "xos.mediaplayer.id"); setupBrokerIfConfigured() }
+    }
+    @Published var brokerPostIntervalSeconds: Double = {
+        let v = UserDefaults.standard.double(forKey: "xos.broker.interval"); return v > 0 ? v : 0.5
+    }() {
+        didSet { UserDefaults.standard.set(brokerPostIntervalSeconds, forKey: "xos.broker.interval") }
+    }
+
+    private var brokerPublisher: MQTTBrokerPublisher?
+    private var brokerTicker: Timer?
+    private var lastPostedIndex: Int = -1
+
     // Subtitle parsing cache
     private var subtitleCuesByLocalVideoURL: [URL: [SubtitleCue]] = [:]
 
@@ -108,6 +131,7 @@ final class MediaPlayerViewModel: ObservableObject {
         Task { await loadPlaylistAndPreparePlaybackThenStart() }
         setupPeriodicPlayerTimeObserverForSubtitles()
         setupSyncNetworkingIfConfigured()
+        setupBrokerIfConfigured()
     }
 
     func toggleSettingsSheet() { isShowingSettingsSheet.toggle() }
@@ -325,6 +349,7 @@ final class MediaPlayerViewModel: ObservableObject {
         }
 
         self.avQueuePlayer.play()
+        self.postPlaybackStatus()
     }
 
     // MARK: Subtitles + Sync helpers (moved from extension)
@@ -472,6 +497,91 @@ final class MediaPlayerViewModel: ObservableObject {
     // Internal State
     private var originalQueueItems: [AVPlayerItem] = []
     private var endOfQueueObserverToken: Any?
+
+    private func setupBrokerIfConfigured() {
+        brokerTicker?.invalidate(); brokerTicker = nil
+
+        let cfg = BrokerConfig(
+            isEnabled: brokerIsEnabled,
+            urlString: brokerURLString,
+            clientId: brokerClientId,
+            mediaPlayerId: mediaPlayerIdentifierForBroker,
+            postIntervalSeconds: brokerPostIntervalSeconds
+        )
+
+        if brokerPublisher == nil {
+            brokerPublisher = MQTTBrokerPublisher(config: cfg)
+        } else {
+            brokerPublisher?.update(config: cfg)
+        }
+
+        if cfg.isEnabled {
+            brokerPublisher?.start()
+            startBrokerTicker(interval: cfg.postIntervalSeconds)
+            postLifecycleEventStarted()
+        } else {
+            brokerPublisher?.stop()
+        }
+    }
+
+    private func startBrokerTicker(interval: Double) {
+        brokerTicker = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.postPlaybackStatus()
+        }
+    }
+
+    private func postLifecycleEventStarted() {
+        let payload: [String: Any] = [
+            "datetime": ISO8601DateFormatter().string(from: Date()),
+            "event": "player_started",
+            "playlist_id": Int(userEditablePlaylistIdentifier) ?? 1,
+            "media_player_id": Int(mediaPlayerIdentifierForBroker) ?? 1
+        ]
+        brokerPublisher?.publishStatus(payload)
+    }
+
+    private func currentDurationMilliseconds() -> Int {
+        if let dur = avQueuePlayer.currentItem?.asset.duration, dur.isNumeric {
+            return Int((CMTimeGetSeconds(dur) * 1000.0).rounded())
+        }
+        return 0
+    }
+
+    private func postPlaybackStatus() {
+        // Build status similar to Python payload
+        let idx = currentPlaylistIndex() ?? -1
+        let posSeconds = avQueuePlayer.currentTime().seconds
+        let durMs = currentDurationMilliseconds()
+        let posFraction: Double = {
+            guard durMs > 0 else { return 0.0 }
+            let ms = Int((posSeconds * 1000.0).rounded())
+            return max(0.0, min(1.0, Double(ms) / Double(durMs)))
+        }()
+
+        var currentName: String = ""
+        if let asset = avQueuePlayer.currentItem?.asset as? AVURLAsset {
+            currentName = asset.url.lastPathComponent
+        }
+
+        let payload: [String: Any] = [
+            "datetime": ISO8601DateFormatter().string(from: Date()),
+            "playlist_id": Int(userEditablePlaylistIdentifier) ?? 1,
+            "media_player_id": Int(mediaPlayerIdentifierForBroker) ?? 1,
+            "label_id": NSNull(), // not tracked here
+            "playlist_position": idx,
+            "playback_position": posFraction,
+            "dropped_audio_frames": 0,
+            "dropped_video_frames": 0,
+            "duration": durMs,
+            "player_volume": NSNull(), // not available cross-platform without extra APIs
+            "system_volume": NSNull(),
+            "current_item": currentName
+        ]
+
+        brokerPublisher?.publishStatus(payload)
+    }
+
 }
 
 // MARK: - Views
@@ -879,31 +989,52 @@ struct SyncAndSubtitleSettings: View {
     var body: some View {
         Section("Subtitles") {
             Toggle("Show subtitles if available", isOn: $viewModel.showSubtitlesIfAvailable)
-            Stepper(value: $viewModel.subtitleFontPointSize, in: 12...72, step: 2) { Text("Font size: \(Int(viewModel.subtitleFontPointSize))") }
+            Stepper(value: $viewModel.subtitleFontPointSize, in: 12...72, step: 2) {
+                Text("Font size: \(Int(viewModel.subtitleFontPointSize))")
+            }
             Toggle("Bold text", isOn: $viewModel.subtitleIsBold)
         }
-        Section("Multi‑device Sync") {
+        Section("Multi-device Sync") {
             Toggle("This device is the sync server", isOn: $viewModel.isThisDeviceTheSyncServer)
             TextField("Server hostname/IP (for clients)", text: $viewModel.syncServerHostnameOrIpAddress)
+                .autocorrectionDisabled(true)
+            Stepper(value: Binding(get: { Int(viewModel.syncListeningPortNumber) }, set: { newVal in
+                let clamped = max(1000, min(65500, newVal))
+                viewModel.syncListeningPortNumber = UInt16(clamped)
+            }), in: 1000...65500, step: 1) { Text("Port: \(viewModel.syncListeningPortNumber)") }
+            Stepper(value: $viewModel.syncDriftThresholdMilliseconds, in: 5...500, step: 1) { Text("Drift threshold (ms): \(viewModel.syncDriftThresholdMilliseconds)") }
+            Stepper(value: $viewModel.syncLatencyMilliseconds, in: 0...500, step: 1) { Text("Sync latency (ms): \(viewModel.syncLatencyMilliseconds)") }
+            Stepper(value: $viewModel.syncIgnoreThresholdMilliseconds, in: 100...10000, step: 100) { Text("Ignore threshold remaining (ms): \(viewModel.syncIgnoreThresholdMilliseconds)") }
+            Text("Clients: set the server hostname/IP and leave ‘This device is the sync server’ OFF. The client will auto-listen and adjust playback.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        Section("Message Broker (MQTT → amq.topic)") {
+            Toggle("Enable broker publishing", isOn: $viewModel.brokerIsEnabled)
+            TextField("Broker URL (mqtt[s]://user:pass@host:port)", text: $viewModel.brokerURLString)
                 .autocorrectionDisabled(true)
                 #if os(iOS)
                 .autocapitalization(.none)
                 #endif
-            Stepper(value: Binding(get: { Int(viewModel.syncListeningPortNumber) }, set: { newVal in
-                let clamped = max(10000, min(10001, newVal))
-                viewModel.syncListeningPortNumber = UInt16(clamped)
-            }), in: 1000...65500, step: 1) { Text("Port: \(viewModel.syncListeningPortNumber)") }
-            Stepper(value: $viewModel.syncDriftThresholdMilliseconds, in: 5...500, step: 5) { Text("Drift threshold (ms): \(viewModel.syncDriftThresholdMilliseconds)") }
-            Stepper(value: $viewModel.syncLatencyMilliseconds, in: 0...500, step: 5) { Text("Sync latency (ms): \(viewModel.syncLatencyMilliseconds)") }
-            Stepper(value: $viewModel.syncIgnoreThresholdMilliseconds, in: 100...10000, step: 100) { Text("Ignore threshold remaining (ms): \(viewModel.syncIgnoreThresholdMilliseconds)") }
-            Text("Clients: set the server hostname/IP and leave ‘This device is the sync server’ OFF. The client will auto‑listen and adjust playback.")
+            TextField("Client ID", text: $viewModel.brokerClientId)
+                .autocorrectionDisabled(true)
+                #if os(iOS)
+                .autocapitalization(.none)
+                #endif
+            TextField("Media Player ID (topic suffix)", text: $viewModel.mediaPlayerIdentifierForBroker)
+                .autocorrectionDisabled(true)
+                #if os(iOS)
+                .autocapitalization(.none)
+                #endif
+            Stepper(value: $viewModel.brokerPostIntervalSeconds, in: 0.1...5.0, step: 0.1) {
+                Text("Post interval: \(String(format: "%.1f", viewModel.brokerPostIntervalSeconds))s")
+            }
+            Text("Publishes JSON to topic mediaplayer.{id}. In RabbitMQ with the MQTT plugin, this maps to exchange amq.topic with routing key mediaplayer.{id}.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
 }
-
-
 
 #if os(macOS)
 struct MacVideoSurface: NSViewRepresentable {
