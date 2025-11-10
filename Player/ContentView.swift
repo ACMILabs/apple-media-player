@@ -125,6 +125,7 @@ final class MediaPlayerViewModel: ObservableObject {
     // MARK: Configuration
     private let xosApiEndpointBase: String = "https://xos.acmi.net.au/api/"
     private var xosPlaylistEndpoint: String { xosApiEndpointBase.hasSuffix("/") ? xosApiEndpointBase + "playlists/" : xosApiEndpointBase + "/playlists/" }
+    private var lastLoadedPlaylist: XOSPlaylistResponse? = nil
 
     // MARK: Public API
     func onAppearStartPlayback() {
@@ -157,6 +158,7 @@ final class MediaPlayerViewModel: ObservableObject {
         let playlistId = userEditablePlaylistIdentifier
         do {
             let playlistResponse = try await fetchPlaylistPreferCache(playlistIdentifier: playlistId)
+            self.lastLoadedPlaylist = playlistResponse
             let playerItems = try await prepareLocalPlayerItemsFrom(playlistResponse: playlistResponse)
             await configurePlayerQueueWith(itemsToPlayInOrder: playerItems)
             avQueuePlayer.play()
@@ -168,6 +170,7 @@ final class MediaPlayerViewModel: ObservableObject {
             // If something else failed, try showing cached playlist if available
             if let cached = try? loadCachedPlaylist(playlistIdentifier: playlistId) {
                 do {
+                    self.lastLoadedPlaylist = cached.playlist
                     let playerItems = try await prepareLocalPlayerItemsFrom(playlistResponse: cached.playlist)
                     await configurePlayerQueueWith(itemsToPlayInOrder: playerItems)
                     avQueuePlayer.play()
@@ -564,11 +567,18 @@ final class MediaPlayerViewModel: ObservableObject {
             currentName = asset.url.lastPathComponent
         }
 
+        // Derive label_id from the playlist at current index
+        let labelIdValue: Any = {
+            guard let playlist = lastLoadedPlaylist, idx >= 0, idx < playlist.playlist_labels.count else { return NSNull() }
+            let labelId = playlist.playlist_labels[idx].label?.id
+            return labelId as Any? ?? NSNull()
+        }()
+
         let payload: [String: Any] = [
             "datetime": ISO8601DateFormatter().string(from: Date()),
             "playlist_id": Int(userEditablePlaylistIdentifier) ?? 1,
             "media_player_id": Int(mediaPlayerIdentifierForBroker) ?? 1,
-            "label_id": NSNull(), // not tracked here
+            "label_id": labelIdValue,
             "playlist_position": idx,
             "playback_position": posFraction,
             "dropped_audio_frames": 0,
@@ -607,7 +617,8 @@ struct MediaPlayerRootView: View {
                 onClearCache: { viewModel.clearAllCachedData() },
                 extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
             )
-            .presentationDetents([.medium, .large])
+            .presentationDetents([.large, .large])
+            .frame(width: 1080)
         }
         .modifier(FullscreenWindowModifier())
     }
@@ -660,6 +671,7 @@ struct SettingsSheetView<ExtraContent: View>: View {
     var onSaveAndReload: () -> Void
     var onClearCache: () -> Void
     var extraContent: () -> ExtraContent
+    @Environment(\.dismiss) private var dismiss
 
     init(playlistIdentifier: Binding<String>, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
         self._playlistIdentifier = playlistIdentifier
@@ -679,7 +691,7 @@ struct SettingsSheetView<ExtraContent: View>: View {
                         #endif
                 }
                 Section("Cache") {
-                    Button("Clear Cached Playlist and Videos") { onClearCache() }
+                    Button("Clear Cached Playlist and Videos") { onClearCache(); dismiss() }
                         .buttonStyle(.borderedProminent)
                 }
                 extraContent()
@@ -687,9 +699,10 @@ struct SettingsSheetView<ExtraContent: View>: View {
             .navigationTitle("Settings")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save & Reload") { onSaveAndReload() }
+                    Button("Save & Reload") { onSaveAndReload(); dismiss() }
                 }
             }
+            .padding()
         }
     }
 }
@@ -715,11 +728,6 @@ struct FullscreenWindowModifier: ViewModifier {
     }
     #endif
 }
-
-
-// ------------------------------------------------------------
-// v2: Added multi-device sync (simple UDP) and subtitle handling
-// ------------------------------------------------------------
 
 import Network
 
@@ -1045,7 +1053,7 @@ struct MacVideoSurface: NSViewRepresentable {
         v.controlsStyle = .none
         v.showsFullScreenToggleButton = false
         v.updatesNowPlayingInfoCenter = false
-        v.videoGravity = .resizeAspectFill
+        v.videoGravity = .resizeAspect
         v.player = player
         return v
     }

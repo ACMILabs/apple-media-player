@@ -46,7 +46,7 @@ final class MQTTBrokerPublisher: NSObject, CocoaMQTTDelegate {
     }
 
     func mqtt(_ mqtt: CocoaMQTT, didPublishMessage message: CocoaMQTTMessage, id: UInt16) {
-        print("[Broker]: Published message: \(message.string ?? "<empty>")")
+        // print("[Broker]: Published message: \(message.string ?? "<empty>")")
         print("[Broker]: Published with ID: \(id), to topic: \(message.topic)")
     }
 
