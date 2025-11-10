@@ -610,6 +610,16 @@ struct MediaPlayerRootView: View {
             }
         }
         .task { viewModel.onAppearStartPlayback() }
+#if os(tvOS)
+        .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
+            SettingsSheetView(
+                playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                onSaveAndReload: { viewModel.saveSettingsAndReload() },
+                onClearCache: { viewModel.clearAllCachedData() },
+                extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
+            )
+        }
+#else
         .sheet(isPresented: $viewModel.isShowingSettingsSheet) {
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
@@ -620,6 +630,7 @@ struct MediaPlayerRootView: View {
             .presentationDetents([.large, .large])
             .frame(width: 1080)
         }
+#endif
         .modifier(FullscreenWindowModifier())
     }
 
@@ -992,20 +1003,69 @@ extension MediaPlayerRootView {
 }
 
 // Sync + Subtitle controls inside the sheet
+// Sync + Subtitle controls inside the sheet
 struct SyncAndSubtitleSettings: View {
     @ObservedObject var viewModel: MediaPlayerViewModel
+
     var body: some View {
         Section("Subtitles") {
             Toggle("Show subtitles if available", isOn: $viewModel.showSubtitlesIfAvailable)
+#if !os(tvOS)
             Stepper(value: $viewModel.subtitleFontPointSize, in: 12...72, step: 2) {
                 Text("Font size: \(Int(viewModel.subtitleFontPointSize))")
             }
+#else
+            Picker("Font size", selection: $viewModel.subtitleFontPointSize) {
+                ForEach(Array(stride(from: 12, through: 72, by: 2)), id: \.self) { size in
+                    Text("\(Int(size))").tag(size)
+                }
+            }
+            .pickerStyle(.menu)
+#endif
+
             Toggle("Bold text", isOn: $viewModel.subtitleIsBold)
         }
+
         Section("Multi-device Sync") {
             Toggle("This device is the sync server", isOn: $viewModel.isThisDeviceTheSyncServer)
+
             TextField("Server hostname/IP (for clients)", text: $viewModel.syncServerHostnameOrIpAddress)
                 .autocorrectionDisabled(true)
+#if os(iOS)
+            .autocapitalization(.none)
+#endif
+
+#if os(tvOS)
+            // tvOS: use Pickers instead of Steppers
+            Picker("Port", selection: Binding(get: { Int(viewModel.syncListeningPortNumber) }, set: { newVal in
+                let clamped = max(1000, min(65500, newVal))
+                viewModel.syncListeningPortNumber = UInt16(clamped)
+            })) {
+                // Offer a reasonable set of common ports plus current value if custom
+                let ports: [Int] = [1000, 1883, 1884, 4222, 5672, 61613, 10000, 20000, 30000, 40000, 50000, 60000, 65500]
+                ForEach(Array(Set(ports + [Int(viewModel.syncListeningPortNumber)])).sorted(), id: \.self) { p in
+                    Text("\(p)").tag(p)
+                }
+            }
+
+            Picker("Drift threshold (ms)", selection: $viewModel.syncDriftThresholdMilliseconds) {
+                ForEach(Array(stride(from: 5, through: 500, by: 5)), id: \.self) { v in
+                    Text("\(v)").tag(v)
+                }
+            }
+
+            Picker("Sync latency (ms)", selection: $viewModel.syncLatencyMilliseconds) {
+                ForEach(Array(stride(from: 0, through: 500, by: 5)), id: \.self) { v in
+                    Text("\(v)").tag(v)
+                }
+            }
+
+            Picker("Ignore threshold remaining (ms)", selection: $viewModel.syncIgnoreThresholdMilliseconds) {
+                ForEach(Array(stride(from: 100, through: 10000, by: 100)), id: \.self) { v in
+                    Text("\(v)").tag(v)
+                }
+            }
+#else
             Stepper(value: Binding(get: { Int(viewModel.syncListeningPortNumber) }, set: { newVal in
                 let clamped = max(1000, min(65500, newVal))
                 viewModel.syncListeningPortNumber = UInt16(clamped)
@@ -1013,30 +1073,45 @@ struct SyncAndSubtitleSettings: View {
             Stepper(value: $viewModel.syncDriftThresholdMilliseconds, in: 5...500, step: 1) { Text("Drift threshold (ms): \(viewModel.syncDriftThresholdMilliseconds)") }
             Stepper(value: $viewModel.syncLatencyMilliseconds, in: 0...500, step: 1) { Text("Sync latency (ms): \(viewModel.syncLatencyMilliseconds)") }
             Stepper(value: $viewModel.syncIgnoreThresholdMilliseconds, in: 100...10000, step: 100) { Text("Ignore threshold remaining (ms): \(viewModel.syncIgnoreThresholdMilliseconds)") }
+#endif
+
             Text("Clients: set the server hostname/IP and leave ‘This device is the sync server’ OFF. The client will auto-listen and adjust playback.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+
         Section("Message Broker (MQTT → amq.topic)") {
             Toggle("Enable broker publishing", isOn: $viewModel.brokerIsEnabled)
+
             TextField("Broker URL (mqtt[s]://user:pass@host:port)", text: $viewModel.brokerURLString)
                 .autocorrectionDisabled(true)
-                #if os(iOS)
+#if os(iOS)
                 .autocapitalization(.none)
-                #endif
+#endif
+
             TextField("Client ID", text: $viewModel.brokerClientId)
                 .autocorrectionDisabled(true)
-                #if os(iOS)
+#if os(iOS)
                 .autocapitalization(.none)
-                #endif
+#endif
+
             TextField("Media Player ID (topic suffix)", text: $viewModel.mediaPlayerIdentifierForBroker)
                 .autocorrectionDisabled(true)
-                #if os(iOS)
+#if os(iOS)
                 .autocapitalization(.none)
-                #endif
+#endif
+#if os(tvOS)
+            Picker("Post interval (s)", selection: $viewModel.brokerPostIntervalSeconds) {
+                ForEach(Array(stride(from: 0.1, through: 5.0, by: 0.1)), id: \.self) { v in
+                    Text(String(format: "%.1f", v)).tag(v)
+                }
+            }
+#else
             Stepper(value: $viewModel.brokerPostIntervalSeconds, in: 0.1...5.0, step: 0.1) {
                 Text("Post interval: \(String(format: "%.1f", viewModel.brokerPostIntervalSeconds))s")
             }
+#endif
+
             Text("Publishes JSON to topic mediaplayer.{id}. In RabbitMQ with the MQTT plugin, this maps to exchange amq.topic with routing key mediaplayer.{id}.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -1063,6 +1138,13 @@ struct MacVideoSurface: NSViewRepresentable {
     }
 }
 #endif
+
+extension Double {
+    fileprivate func rounded(toPlaces places: Int) -> Double {
+        let divisor = pow(10.0, Double(places))
+        return (self * divisor).rounded() / divisor
+    }
+}
 
 // MARK: - Previews
 
