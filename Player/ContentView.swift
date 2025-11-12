@@ -72,12 +72,12 @@ final class MediaPlayerViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(Int(syncListeningPortNumber), forKey: "xos.sync.port"); setupSyncNetworkingIfConfigured() }
     }
     @Published var syncDriftThresholdMilliseconds: Int = {
-        let v = UserDefaults.standard.integer(forKey: "xos.sync.driftThresholdMs"); return v == 0 ? 40 : v
+        let v = UserDefaults.standard.integer(forKey: "xos.sync.driftThresholdMs"); return v == 0 ? 20 : v
     }() {
         didSet { UserDefaults.standard.set(syncDriftThresholdMilliseconds, forKey: "xos.sync.driftThresholdMs") }
     }
     @Published var syncLatencyMilliseconds: Int = {
-        let v = UserDefaults.standard.integer(forKey: "xos.sync.latencyMs"); return v == 0 ? 30 : v
+        let v = UserDefaults.standard.integer(forKey: "xos.sync.latencyMs"); return v == 0 ? 167 : v
     }() {
         didSet { UserDefaults.standard.set(syncLatencyMilliseconds, forKey: "xos.sync.latencyMs") }
     }
@@ -133,6 +133,16 @@ final class MediaPlayerViewModel: ObservableObject {
         setupPeriodicPlayerTimeObserverForSubtitles()
         setupSyncNetworkingIfConfigured()
         setupBrokerIfConfigured()
+    }
+
+    func onAppBecameActive() {
+        // Recreate server/client + timers after app returns
+        setupSyncNetworkingIfConfigured()
+    }
+
+    func onSettingsSheetClosed() {
+        // When the settings sheet is dismissed, reset sync
+        setupSyncNetworkingIfConfigured()
     }
 
     func toggleSettingsSheet() { isShowingSettingsSheet.toggle() }
@@ -598,6 +608,7 @@ final class MediaPlayerViewModel: ObservableObject {
 
 struct MediaPlayerRootView: View {
     @StateObject private var viewModel = MediaPlayerViewModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -610,6 +621,11 @@ struct MediaPlayerRootView: View {
             }
         }
         .task { viewModel.onAppearStartPlayback() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                viewModel.onAppBecameActive()
+            }
+        }
 #if os(tvOS)
         .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
             SettingsSheetView(
@@ -619,8 +635,26 @@ struct MediaPlayerRootView: View {
                 extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
             )
         }
+        .onChange(of: viewModel.isShowingSettingsSheet) { isPresented in
+            if !isPresented {
+                viewModel.onSettingsSheetClosed()
+            }
+        }
 #else
         .sheet(isPresented: $viewModel.isShowingSettingsSheet) {
+#if os(iOS)
+            GeometryReader { proxy in
+                let minWidth = min(1080, proxy.size.width)
+                SettingsSheetView(
+                    playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    onSaveAndReload: { viewModel.saveSettingsAndReload() },
+                    onClearCache: { viewModel.clearAllCachedData() },
+                    extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
+                )
+                .presentationDetents([.large, .large])
+                .frame(width: minWidth)
+            }
+#else
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
@@ -629,6 +663,12 @@ struct MediaPlayerRootView: View {
             )
             .presentationDetents([.large, .large])
             .frame(width: 1080)
+#endif
+        }
+        .onChange(of: viewModel.isShowingSettingsSheet) { isPresented in
+            if !isPresented {
+                viewModel.onSettingsSheetClosed()
+            }
         }
 #endif
         .modifier(FullscreenWindowModifier())
@@ -1002,7 +1042,6 @@ extension MediaPlayerRootView {
     }
 }
 
-// Sync + Subtitle controls inside the sheet
 // Sync + Subtitle controls inside the sheet
 struct SyncAndSubtitleSettings: View {
     @ObservedObject var viewModel: MediaPlayerViewModel
