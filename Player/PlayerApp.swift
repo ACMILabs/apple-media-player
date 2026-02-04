@@ -11,38 +11,50 @@ import CoreData
 @main
 struct PlayerApp: App {
     let persistenceController = PersistenceController.shared
-#if os(macOS)
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-#endif
 
     var body: some Scene {
+#if os(macOS)
         WindowGroup {
-            MediaPlayerRootView()
+            SessionWindowRootView()
                 .background(Color.black)
-                .onAppear {
-#if os(macOS)
-                    NSApp.activate(ignoringOtherApps: true)
-#endif
-                }
+                .onAppear { NSApp.activate(ignoringOtherApps: true) }
         }
-#if os(macOS)
         .windowStyle(.hiddenTitleBar)
+#else
+        WindowGroup {
+            SessionWindowRootView()
+                .background(Color.black)
+        }
 #endif
     }
 }
 
 #if os(macOS)
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // Enter fullscreen only after the first runloop turn.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            guard let w = NSApp.windows.first else { return }
-            w.collectionBehavior = [.fullScreenPrimary]
-            w.delegate = self
-            if !w.styleMask.contains(.fullScreen) {
-                w.toggleFullScreen(nil)
+struct SessionWindowRootView: View {
+    @SceneStorage("xos.window.sessionId") private var persistedSessionId: String = ""
+    @State private var generatedSessionId = UUID().uuidString.lowercased()
+
+    private var activeSessionId: String {
+        persistedSessionId.isEmpty ? generatedSessionId : persistedSessionId
+    }
+
+    var body: some View {
+        MediaPlayerRootView(sessionId: activeSessionId)
+            .id(activeSessionId)
+            .onAppear {
+                // Give macOS a runloop turn to restore SceneStorage before creating a new ID.
+                DispatchQueue.main.async {
+                    if persistedSessionId.isEmpty {
+                        persistedSessionId = generatedSessionId
+                    }
+                }
             }
-        }
+    }
+}
+#else
+struct SessionWindowRootView: View {
+    var body: some View {
+        MediaPlayerRootView(sessionId: "default")
     }
 }
 #endif
