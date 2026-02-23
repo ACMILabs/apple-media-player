@@ -55,6 +55,12 @@ final class MediaPlayerViewModel: ObservableObject {
         didSet { persist(userEditablePlaylistIdentifier, for: .playlistIdentifier) }
     }
     @Published var avQueuePlayer: AVQueuePlayer = AVQueuePlayer()
+    @Published var isPlaybackMuted: Bool = false {
+        didSet {
+            avQueuePlayer.isMuted = isPlaybackMuted
+            persist(isPlaybackMuted, for: .playbackMuted)
+        }
+    }
 
     // MARK: Subtitles + Sync Settings (moved from extension)
     @Published var showSubtitlesIfAvailable: Bool = true {
@@ -155,6 +161,7 @@ final class MediaPlayerViewModel: ObservableObject {
 
     private enum SessionSetting: String {
         case playlistIdentifier = "playlist.id"
+        case playbackMuted = "playback.muted"
         case subtitlesEnabled = "subtitles.show"
         case subtitleFontSize = "subtitles.fontSize"
         case subtitleBold = "subtitles.bold"
@@ -182,6 +189,7 @@ final class MediaPlayerViewModel: ObservableObject {
 
     private func hydrateStateFromDefaults() {
         userEditablePlaylistIdentifier = defaults.string(forKey: namespacedKey(.playlistIdentifier)) ?? "1"
+        isPlaybackMuted = defaults.object(forKey: namespacedKey(.playbackMuted)) as? Bool ?? false
         showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? true
         subtitleFontPointSize = CGFloat(defaults.object(forKey: namespacedKey(.subtitleFontSize)) as? Int ?? 28)
         subtitleIsBold = defaults.object(forKey: namespacedKey(.subtitleBold)) as? Bool ?? false
@@ -396,6 +404,7 @@ final class MediaPlayerViewModel: ObservableObject {
         let player = avQueuePlayer
         player.removeAllItems()
         player.actionAtItemEnd = .advance
+        player.isMuted = isPlaybackMuted
         itemsToPlayInOrder.forEach { player.insert($0, after: nil) }
 
         addEndOfQueueObserverToLoop()
@@ -449,6 +458,7 @@ final class MediaPlayerViewModel: ObservableObject {
         }
 
         self.avQueuePlayer.play()
+        self.avQueuePlayer.isMuted = self.isPlaybackMuted
         self.postPlaybackStatus()
     }
 
@@ -723,6 +733,7 @@ struct MediaPlayerRootView: View {
         .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                isPlaybackMuted: $viewModel.isPlaybackMuted,
                 sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
                 onClearCache: { viewModel.clearAllCachedData() },
@@ -741,6 +752,7 @@ struct MediaPlayerRootView: View {
                 let minWidth = min(1080, proxy.size.width)
                 SettingsSheetView(
                     playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    isPlaybackMuted: $viewModel.isPlaybackMuted,
                     sessionIdentifier: viewModel.sessionId,
                     onSaveAndReload: { viewModel.saveSettingsAndReload() },
                     onClearCache: { viewModel.clearAllCachedData() },
@@ -752,6 +764,7 @@ struct MediaPlayerRootView: View {
 #else
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                isPlaybackMuted: $viewModel.isPlaybackMuted,
                 sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
                 onClearCache: { viewModel.clearAllCachedData() },
@@ -815,14 +828,16 @@ struct MediaPlayerRootView: View {
 
 struct SettingsSheetView<ExtraContent: View>: View {
     @Binding var playlistIdentifier: String
+    @Binding var isPlaybackMuted: Bool
     let sessionIdentifier: String
     var onSaveAndReload: () -> Void
     var onClearCache: () -> Void
     var extraContent: () -> ExtraContent
     @Environment(\.dismiss) private var dismiss
 
-    init(playlistIdentifier: Binding<String>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
+    init(playlistIdentifier: Binding<String>, isPlaybackMuted: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
         self._playlistIdentifier = playlistIdentifier
+        self._isPlaybackMuted = isPlaybackMuted
         self.sessionIdentifier = sessionIdentifier
         self.onSaveAndReload = onSaveAndReload
         self.onClearCache = onClearCache
@@ -838,6 +853,7 @@ struct SettingsSheetView<ExtraContent: View>: View {
                         #if os(iOS)
                         .autocapitalization(.none)
                         #endif
+                    Toggle("Mute playback", isOn: $isPlaybackMuted)
                     LabeledContent("Session ID") {
                         Text(sessionIdentifier)
                             .font(.caption.monospaced())
