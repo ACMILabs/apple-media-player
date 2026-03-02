@@ -43,69 +43,93 @@ import AppKit
 
 @MainActor
 final class MediaPlayerViewModel: ObservableObject {
+    let sessionId: String
+    private let defaults: UserDefaults
+    private var isHydratingFromDefaults = true
 
     // MARK: Public UI State
     @Published var isShowingSettingsSheet: Bool = false
     @Published var isLoadingPlaylistAndVideos: Bool = true
     @Published var isOfflineWithNoCachedData: Bool = false
-    @Published var userEditablePlaylistIdentifier: String = UserDefaults.standard.string(forKey: "xos.playlist.id") ?? "1"
+    @Published var userEditablePlaylistIdentifier: String = "1" {
+        didSet { persist(userEditablePlaylistIdentifier, for: .playlistIdentifier) }
+    }
     @Published var avQueuePlayer: AVQueuePlayer = AVQueuePlayer()
+    @Published var isPlaybackMuted: Bool = false {
+        didSet {
+            avQueuePlayer.isMuted = isPlaybackMuted
+            persist(isPlaybackMuted, for: .playbackMuted)
+        }
+    }
 
     // MARK: Subtitles + Sync Settings (moved from extension)
-    @Published var showSubtitlesIfAvailable: Bool = UserDefaults.standard.object(forKey: "xos.subtitles.show") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showSubtitlesIfAvailable, forKey: "xos.subtitles.show") }
+    @Published var showSubtitlesIfAvailable: Bool = true {
+        didSet { persist(showSubtitlesIfAvailable, for: .subtitlesEnabled) }
     }
-    @Published var subtitleFontPointSize: CGFloat = CGFloat(UserDefaults.standard.object(forKey: "xos.subtitles.fontSize") as? Int ?? 28) {
-        didSet { UserDefaults.standard.set(Int(subtitleFontPointSize), forKey: "xos.subtitles.fontSize") }
+    @Published var subtitleFontPointSize: CGFloat = 28 {
+        didSet { persist(Int(subtitleFontPointSize), for: .subtitleFontSize) }
     }
-    @Published var subtitleIsBold: Bool = UserDefaults.standard.object(forKey: "xos.subtitles.bold") as? Bool ?? false {
-        didSet { UserDefaults.standard.set(subtitleIsBold, forKey: "xos.subtitles.bold") }
+    @Published var subtitleIsBold: Bool = false {
+        didSet { persist(subtitleIsBold, for: .subtitleBold) }
     }
 
-    @Published var isThisDeviceTheSyncServer: Bool = UserDefaults.standard.object(forKey: "xos.sync.isServer") as? Bool ?? false {
-        didSet { UserDefaults.standard.set(isThisDeviceTheSyncServer, forKey: "xos.sync.isServer"); setupSyncNetworkingIfConfigured() }
+    @Published var isThisDeviceTheSyncServer: Bool = false {
+        didSet {
+            persist(isThisDeviceTheSyncServer, for: .syncIsServer)
+            setupSyncNetworkingIfConfigured()
+        }
     }
-    @Published var syncServerHostnameOrIpAddress: String = UserDefaults.standard.string(forKey: "xos.sync.serverHost") ?? "" {
-        didSet { UserDefaults.standard.set(syncServerHostnameOrIpAddress, forKey: "xos.sync.serverHost"); setupSyncNetworkingIfConfigured() }
+    @Published var syncServerHostnameOrIpAddress: String = "" {
+        didSet {
+            persist(syncServerHostnameOrIpAddress, for: .syncServerHost)
+            setupSyncNetworkingIfConfigured()
+        }
     }
-    @Published var syncListeningPortNumber: UInt16 = UInt16(UserDefaults.standard.integer(forKey: "xos.sync.port")) == 0 ? 10000 : UInt16(exactly: UserDefaults.standard.integer(forKey: "xos.sync.port"))! {
-        didSet { UserDefaults.standard.set(Int(syncListeningPortNumber), forKey: "xos.sync.port"); setupSyncNetworkingIfConfigured() }
+    @Published var syncListeningPortNumber: UInt16 = 10000 {
+        didSet {
+            persist(Int(syncListeningPortNumber), for: .syncPort)
+            setupSyncNetworkingIfConfigured()
+        }
     }
-    @Published var syncDriftThresholdMilliseconds: Int = {
-        let v = UserDefaults.standard.integer(forKey: "xos.sync.driftThresholdMs"); return v == 0 ? 20 : v
-    }() {
-        didSet { UserDefaults.standard.set(syncDriftThresholdMilliseconds, forKey: "xos.sync.driftThresholdMs") }
+    @Published var syncDriftThresholdMilliseconds: Int = 20 {
+        didSet { persist(syncDriftThresholdMilliseconds, for: .syncDriftThresholdMs) }
     }
-    @Published var syncLatencyMilliseconds: Int = {
-        let v = UserDefaults.standard.integer(forKey: "xos.sync.latencyMs"); return v == 0 ? 167 : v
-    }() {
-        didSet { UserDefaults.standard.set(syncLatencyMilliseconds, forKey: "xos.sync.latencyMs") }
+    @Published var syncLatencyMilliseconds: Int = 167 {
+        didSet { persist(syncLatencyMilliseconds, for: .syncLatencyMs) }
     }
-    @Published var syncIgnoreThresholdMilliseconds: Int = {
-        let v = UserDefaults.standard.integer(forKey: "xos.sync.ignoreThresholdMs"); return v == 0 ? 2000 : v
-    }() {
-        didSet { UserDefaults.standard.set(syncIgnoreThresholdMilliseconds, forKey: "xos.sync.ignoreThresholdMs") }
+    @Published var syncIgnoreThresholdMilliseconds: Int = 2000 {
+        didSet { persist(syncIgnoreThresholdMilliseconds, for: .syncIgnoreThresholdMs) }
     }
 
     @Published var currentlyVisibleSubtitleText: String = ""
 
     // MQTT message server for label syncing
-    @Published var brokerIsEnabled: Bool = UserDefaults.standard.object(forKey: "xos.broker.enabled") as? Bool ?? false {
-        didSet { UserDefaults.standard.set(brokerIsEnabled, forKey: "xos.broker.enabled"); setupBrokerIfConfigured() }
+    @Published var brokerIsEnabled: Bool = false {
+        didSet {
+            persist(brokerIsEnabled, for: .brokerEnabled)
+            setupBrokerIfConfigured()
+        }
     }
-    @Published var brokerURLString: String = UserDefaults.standard.string(forKey: "xos.broker.url") ?? "" {
-        didSet { UserDefaults.standard.set(brokerURLString, forKey: "xos.broker.url"); setupBrokerIfConfigured() }
+    @Published var brokerURLString: String = "" {
+        didSet {
+            persist(brokerURLString, for: .brokerURL)
+            setupBrokerIfConfigured()
+        }
     }
-    @Published var brokerClientId: String = UserDefaults.standard.string(forKey: "xos.broker.clientId") ?? "xos-\(UUID().uuidString.prefix(8))" {
-        didSet { UserDefaults.standard.set(brokerClientId, forKey: "xos.broker.clientId"); setupBrokerIfConfigured() }
+    @Published var brokerClientId: String = "" {
+        didSet {
+            persist(brokerClientId, for: .brokerClientId)
+            setupBrokerIfConfigured()
+        }
     }
-    @Published var mediaPlayerIdentifierForBroker: String = UserDefaults.standard.string(forKey: "xos.mediaplayer.id") ?? "1" {
-        didSet { UserDefaults.standard.set(mediaPlayerIdentifierForBroker, forKey: "xos.mediaplayer.id"); setupBrokerIfConfigured() }
+    @Published var mediaPlayerIdentifierForBroker: String = "1" {
+        didSet {
+            persist(mediaPlayerIdentifierForBroker, for: .mediaPlayerId)
+            setupBrokerIfConfigured()
+        }
     }
-    @Published var brokerPostIntervalSeconds: Double = {
-        let v = UserDefaults.standard.double(forKey: "xos.broker.interval"); return v > 0 ? v : 0.5
-    }() {
-        didSet { UserDefaults.standard.set(brokerPostIntervalSeconds, forKey: "xos.broker.interval") }
+    @Published var brokerPostIntervalSeconds: Double = 0.5 {
+        didSet { persist(brokerPostIntervalSeconds, for: .brokerIntervalSeconds) }
     }
 
     private var brokerPublisher: MQTTBrokerPublisher?
@@ -126,6 +150,77 @@ final class MediaPlayerViewModel: ObservableObject {
     private let xosApiEndpointBase: String = "https://xos.acmi.net.au/api/"
     private var xosPlaylistEndpoint: String { xosApiEndpointBase.hasSuffix("/") ? xosApiEndpointBase + "playlists/" : xosApiEndpointBase + "/playlists/" }
     private var lastLoadedPlaylist: XOSPlaylistResponse? = nil
+
+    // MARK: Initialisation
+    init(sessionId: String, defaults: UserDefaults = .standard) {
+        self.sessionId = sessionId
+        self.defaults = defaults
+        hydrateStateFromDefaults()
+        isHydratingFromDefaults = false
+    }
+
+    private enum SessionSetting: String {
+        case playlistIdentifier = "playlist.id"
+        case playbackMuted = "playback.muted"
+        case subtitlesEnabled = "subtitles.show"
+        case subtitleFontSize = "subtitles.fontSize"
+        case subtitleBold = "subtitles.bold"
+        case syncIsServer = "sync.isServer"
+        case syncServerHost = "sync.serverHost"
+        case syncPort = "sync.port"
+        case syncDriftThresholdMs = "sync.driftThresholdMs"
+        case syncLatencyMs = "sync.latencyMs"
+        case syncIgnoreThresholdMs = "sync.ignoreThresholdMs"
+        case brokerEnabled = "broker.enabled"
+        case brokerURL = "broker.url"
+        case brokerClientId = "broker.clientId"
+        case mediaPlayerId = "mediaplayer.id"
+        case brokerIntervalSeconds = "broker.interval"
+    }
+
+    private func namespacedKey(_ setting: SessionSetting) -> String {
+        "xos.session.\(sessionId).\(setting.rawValue)"
+    }
+
+    private func persist(_ value: Any, for setting: SessionSetting) {
+        guard !isHydratingFromDefaults else { return }
+        defaults.set(value, forKey: namespacedKey(setting))
+    }
+
+    private func hydrateStateFromDefaults() {
+        userEditablePlaylistIdentifier = defaults.string(forKey: namespacedKey(.playlistIdentifier)) ?? "1"
+        isPlaybackMuted = defaults.object(forKey: namespacedKey(.playbackMuted)) as? Bool ?? false
+        showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? true
+        subtitleFontPointSize = CGFloat(defaults.object(forKey: namespacedKey(.subtitleFontSize)) as? Int ?? 28)
+        subtitleIsBold = defaults.object(forKey: namespacedKey(.subtitleBold)) as? Bool ?? false
+
+        isThisDeviceTheSyncServer = defaults.object(forKey: namespacedKey(.syncIsServer)) as? Bool ?? false
+        syncServerHostnameOrIpAddress = defaults.string(forKey: namespacedKey(.syncServerHost)) ?? ""
+        let savedPort = defaults.integer(forKey: namespacedKey(.syncPort))
+        syncListeningPortNumber = savedPort == 0 ? 10000 : UInt16(clamping: savedPort)
+        let drift = defaults.integer(forKey: namespacedKey(.syncDriftThresholdMs))
+        syncDriftThresholdMilliseconds = drift == 0 ? 20 : drift
+        let latency = defaults.integer(forKey: namespacedKey(.syncLatencyMs))
+        syncLatencyMilliseconds = latency == 0 ? 167 : latency
+        let ignore = defaults.integer(forKey: namespacedKey(.syncIgnoreThresholdMs))
+        syncIgnoreThresholdMilliseconds = ignore == 0 ? 2000 : ignore
+
+        brokerIsEnabled = defaults.object(forKey: namespacedKey(.brokerEnabled)) as? Bool ?? false
+        brokerURLString = defaults.string(forKey: namespacedKey(.brokerURL)) ?? ""
+        brokerClientId = defaults.string(forKey: namespacedKey(.brokerClientId)) ?? "xos-\(sessionId.prefix(8))"
+        mediaPlayerIdentifierForBroker = defaults.string(forKey: namespacedKey(.mediaPlayerId)) ?? defaultMediaPlayerIdentifier(for: sessionId)
+        let interval = defaults.double(forKey: namespacedKey(.brokerIntervalSeconds))
+        brokerPostIntervalSeconds = interval > 0 ? interval : 0.5
+    }
+
+    private func defaultMediaPlayerIdentifier(for sessionId: String) -> String {
+        let compact = sessionId.replacingOccurrences(of: "-", with: "")
+        let hexPrefix = String(compact.prefix(4))
+        if let value = Int(hexPrefix, radix: 16), value > 0 {
+            return String(value)
+        }
+        return "1"
+    }
 
     // MARK: Public API
     func onAppearStartPlayback() {
@@ -148,7 +243,7 @@ final class MediaPlayerViewModel: ObservableObject {
     func toggleSettingsSheet() { isShowingSettingsSheet.toggle() }
 
     func saveSettingsAndReload() {
-        UserDefaults.standard.set(userEditablePlaylistIdentifier, forKey: "xos.playlist.id")
+        persist(userEditablePlaylistIdentifier, for: .playlistIdentifier)
         Task { await loadPlaylistAndPreparePlaybackThenStart() }
     }
 
@@ -309,6 +404,7 @@ final class MediaPlayerViewModel: ObservableObject {
         let player = avQueuePlayer
         player.removeAllItems()
         player.actionAtItemEnd = .advance
+        player.isMuted = isPlaybackMuted
         itemsToPlayInOrder.forEach { player.insert($0, after: nil) }
 
         addEndOfQueueObserverToLoop()
@@ -362,6 +458,7 @@ final class MediaPlayerViewModel: ObservableObject {
         }
 
         self.avQueuePlayer.play()
+        self.avQueuePlayer.isMuted = self.isPlaybackMuted
         self.postPlaybackStatus()
     }
 
@@ -607,8 +704,14 @@ final class MediaPlayerViewModel: ObservableObject {
 // MARK: - Views
 
 struct MediaPlayerRootView: View {
-    @StateObject private var viewModel = MediaPlayerViewModel()
+    let sessionId: String
+    @StateObject private var viewModel: MediaPlayerViewModel
     @Environment(\.scenePhase) private var scenePhase
+
+    init(sessionId: String) {
+        self.sessionId = sessionId
+        _viewModel = StateObject(wrappedValue: MediaPlayerViewModel(sessionId: sessionId))
+    }
 
     var body: some View {
         ZStack {
@@ -630,6 +733,8 @@ struct MediaPlayerRootView: View {
         .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                isPlaybackMuted: $viewModel.isPlaybackMuted,
+                sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
                 onClearCache: { viewModel.clearAllCachedData() },
                 extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
@@ -647,6 +752,8 @@ struct MediaPlayerRootView: View {
                 let minWidth = min(1080, proxy.size.width)
                 SettingsSheetView(
                     playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    isPlaybackMuted: $viewModel.isPlaybackMuted,
+                    sessionIdentifier: viewModel.sessionId,
                     onSaveAndReload: { viewModel.saveSettingsAndReload() },
                     onClearCache: { viewModel.clearAllCachedData() },
                     extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
@@ -657,6 +764,8 @@ struct MediaPlayerRootView: View {
 #else
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                isPlaybackMuted: $viewModel.isPlaybackMuted,
+                sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
                 onClearCache: { viewModel.clearAllCachedData() },
                 extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
@@ -719,13 +828,17 @@ struct MediaPlayerRootView: View {
 
 struct SettingsSheetView<ExtraContent: View>: View {
     @Binding var playlistIdentifier: String
+    @Binding var isPlaybackMuted: Bool
+    let sessionIdentifier: String
     var onSaveAndReload: () -> Void
     var onClearCache: () -> Void
     var extraContent: () -> ExtraContent
     @Environment(\.dismiss) private var dismiss
 
-    init(playlistIdentifier: Binding<String>, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
+    init(playlistIdentifier: Binding<String>, isPlaybackMuted: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
         self._playlistIdentifier = playlistIdentifier
+        self._isPlaybackMuted = isPlaybackMuted
+        self.sessionIdentifier = sessionIdentifier
         self.onSaveAndReload = onSaveAndReload
         self.onClearCache = onClearCache
         self.extraContent = extraContent
@@ -740,6 +853,12 @@ struct SettingsSheetView<ExtraContent: View>: View {
                         #if os(iOS)
                         .autocapitalization(.none)
                         #endif
+                    Toggle("Mute playback", isOn: $isPlaybackMuted)
+                    LabeledContent("Session ID") {
+                        Text(sessionIdentifier)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Section("Cache") {
                     Button("Clear Cached Playlist and Videos") { onClearCache(); dismiss() }
@@ -762,22 +881,8 @@ struct SettingsSheetView<ExtraContent: View>: View {
 
 struct FullscreenWindowModifier: ViewModifier {
     func body(content: Content) -> some View {
-        #if os(macOS)
         content
-            .onAppear { makeWindowFullscreen() }
-        #else
-        content // tvOS is fullscreen by default
-        #endif
     }
-
-    #if os(macOS)
-    private func makeWindowFullscreen() {
-        // Try to enter fullscreen on the key window when available
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NSApp.windows.first?.toggleFullScreen(nil)
-        }
-    }
-    #endif
 }
 
 import Network
@@ -1188,7 +1293,6 @@ extension Double {
 // MARK: - Previews
 
 #Preview("Player Preview") {
-    MediaPlayerRootView()
+    MediaPlayerRootView(sessionId: "preview-session")
         .background(Color.black)
 }
-
