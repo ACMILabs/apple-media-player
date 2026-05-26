@@ -742,15 +742,25 @@ struct MediaPlayerRootView: View {
         }
 #if os(tvOS)
         .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
-            SettingsSheetView(
-                playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
-                xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
-                isPlaybackMuted: $viewModel.isPlaybackMuted,
-                sessionIdentifier: viewModel.sessionId,
-                onSaveAndReload: { viewModel.saveSettingsAndReload() },
-                onClearCache: { viewModel.clearAllCachedData() },
-                extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
-            )
+            ZStack {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .ignoresSafeArea()
+
+                SettingsSheetView(
+                    playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
+                    isPlaybackMuted: $viewModel.isPlaybackMuted,
+                    sessionIdentifier: viewModel.sessionId,
+                    onSaveAndReload: { viewModel.saveSettingsAndReload() },
+                    onClearCache: { viewModel.clearAllCachedData() },
+                    extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
+                )
+                .frame(maxWidth: 1180)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .padding(60)
+            }
         }
         .onChange(of: viewModel.isShowingSettingsSheet) { isPresented in
             if !isPresented {
@@ -800,11 +810,13 @@ struct MediaPlayerRootView: View {
     private var loadingStateView: some View {
         GeometryReader { proxy in
             ZStack {
+                Color.black.ignoresSafeArea()
+
                 VStack {
                     ProgressView()
                         .progressViewStyle(.circular)
                         .scaleEffect(2)
-                        .colorInvert()
+                        .tint(.gray)
                         .padding()
                     Text("Loading...")
                         .foregroundStyle(.white)
@@ -815,6 +827,10 @@ struct MediaPlayerRootView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { viewModel.toggleSettingsSheet() }
+#if os(tvOS)
+        .focusable(true)
+        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+#endif
     }
 
     private var noInternetStateView: some View {
@@ -837,6 +853,10 @@ struct MediaPlayerRootView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { viewModel.toggleSettingsSheet() }
+#if os(tvOS)
+        .focusable(true)
+        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+#endif
     }
 }
 
