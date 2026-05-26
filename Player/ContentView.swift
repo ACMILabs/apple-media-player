@@ -240,6 +240,7 @@ final class MediaPlayerViewModel: ObservableObject {
         setupSyncNetworkingIfConfigured()
     }
 
+    func openSettingsSheet() { isShowingSettingsSheet = true }
     func toggleSettingsSheet() { isShowingSettingsSheet.toggle() }
 
     func saveSettingsAndReload() {
@@ -1128,21 +1129,11 @@ extension MediaPlayerRootView {
         .contentShape(Rectangle())
         .onLongPressGesture { viewModel.toggleSettingsSheet() }
 #if os(macOS)
-        .onKeyPress(.space) {
-            viewModel.toggleSettingsSheet()
-            return .handled
-        }
-        .onKeyPress(.return) {
-            viewModel.toggleSettingsSheet()
-            return .handled
-        }
-        .onKeyPress { press in
-            if press.characters.contains(where: { $0 == "s" || $0 == "S" }) {
-                viewModel.toggleSettingsSheet()
-                return .handled
+        .background(
+            MacSettingsShortcutHandler(isEnabled: !viewModel.isShowingSettingsSheet) {
+                viewModel.openSettingsSheet()
             }
-            return .ignored
-        }
+        )
 #endif
     }
 }
@@ -1264,6 +1255,68 @@ struct SyncAndSubtitleSettings: View {
 }
 
 #if os(macOS)
+private struct MacSettingsShortcutHandler: NSViewRepresentable {
+    let isEnabled: Bool
+    let onOpenSettings: () -> Void
+
+    func makeNSView(context: Context) -> ShortcutHandlingView {
+        let view = ShortcutHandlingView()
+        view.onOpenSettings = onOpenSettings
+        view.isEnabled = isEnabled
+        return view
+    }
+
+    func updateNSView(_ nsView: ShortcutHandlingView, context: Context) {
+        nsView.onOpenSettings = onOpenSettings
+        nsView.isEnabled = isEnabled
+    }
+
+    final class ShortcutHandlingView: NSView {
+        var isEnabled = true
+        var onOpenSettings: () -> Void = {}
+        private var keyDownMonitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            updateKeyDownMonitor()
+        }
+
+        deinit {
+            if let keyDownMonitor {
+                NSEvent.removeMonitor(keyDownMonitor)
+            }
+        }
+
+        private func updateKeyDownMonitor() {
+            if let keyDownMonitor {
+                NSEvent.removeMonitor(keyDownMonitor)
+            }
+
+            keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self else { return event }
+                guard self.isEnabled, event.window === self.window else { return event }
+                guard event.modifierFlags.intersection([.command, .control, .option, .function]).isEmpty else { return event }
+
+                if Self.opensSettings(event) {
+                    self.onOpenSettings()
+                    return nil
+                }
+
+                return event
+            }
+        }
+
+        private static func opensSettings(_ event: NSEvent) -> Bool {
+            switch event.keyCode {
+            case 36, 49:
+                return true
+            default:
+                return event.charactersIgnoringModifiers?.lowercased() == "s"
+            }
+        }
+    }
+}
+
 struct MacVideoSurface: NSViewRepresentable {
     let player: AVPlayer
 
