@@ -54,6 +54,9 @@ final class MediaPlayerViewModel: ObservableObject {
     @Published var userEditablePlaylistIdentifier: String = "1" {
         didSet { persist(userEditablePlaylistIdentifier, for: .playlistIdentifier) }
     }
+    @Published var userEditableXOSApiEndpointBase: String = MediaPlayerViewModel.defaultXOSApiEndpointBase {
+        didSet { persist(userEditableXOSApiEndpointBase, for: .xosApiEndpointBase) }
+    }
     @Published var avQueuePlayer: AVQueuePlayer = AVQueuePlayer()
     @Published var isPlaybackMuted: Bool = false {
         didSet {
@@ -63,7 +66,7 @@ final class MediaPlayerViewModel: ObservableObject {
     }
 
     // MARK: Subtitles + Sync Settings (moved from extension)
-    @Published var showSubtitlesIfAvailable: Bool = true {
+    @Published var showSubtitlesIfAvailable: Bool = false {
         didSet { persist(showSubtitlesIfAvailable, for: .subtitlesEnabled) }
     }
     @Published var subtitleFontPointSize: CGFloat = 28 {
@@ -147,7 +150,11 @@ final class MediaPlayerViewModel: ObservableObject {
     private var syncLockedIndex: Int? = nil
 
     // MARK: Configuration
-    private let xosApiEndpointBase: String = "https://xos.acmi.net.au/api/"
+    private static let defaultXOSApiEndpointBase: String = "https://xos.acmi.net.au/api/"
+    private var xosApiEndpointBase: String {
+        let trimmed = userEditableXOSApiEndpointBase.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? Self.defaultXOSApiEndpointBase : trimmed
+    }
     private var xosPlaylistEndpoint: String { xosApiEndpointBase.hasSuffix("/") ? xosApiEndpointBase + "playlists/" : xosApiEndpointBase + "/playlists/" }
     private var lastLoadedPlaylist: XOSPlaylistResponse? = nil
 
@@ -161,6 +168,7 @@ final class MediaPlayerViewModel: ObservableObject {
 
     private enum SessionSetting: String {
         case playlistIdentifier = "playlist.id"
+        case xosApiEndpointBase = "xos.apiEndpointBase"
         case playbackMuted = "playback.muted"
         case subtitlesEnabled = "subtitles.show"
         case subtitleFontSize = "subtitles.fontSize"
@@ -189,8 +197,9 @@ final class MediaPlayerViewModel: ObservableObject {
 
     private func hydrateStateFromDefaults() {
         userEditablePlaylistIdentifier = defaults.string(forKey: namespacedKey(.playlistIdentifier)) ?? "1"
+        userEditableXOSApiEndpointBase = defaults.string(forKey: namespacedKey(.xosApiEndpointBase)) ?? Self.defaultXOSApiEndpointBase
         isPlaybackMuted = defaults.object(forKey: namespacedKey(.playbackMuted)) as? Bool ?? false
-        showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? true
+        showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? false
         subtitleFontPointSize = CGFloat(defaults.object(forKey: namespacedKey(.subtitleFontSize)) as? Int ?? 28)
         subtitleIsBold = defaults.object(forKey: namespacedKey(.subtitleBold)) as? Bool ?? false
 
@@ -225,7 +234,6 @@ final class MediaPlayerViewModel: ObservableObject {
     // MARK: Public API
     func onAppearStartPlayback() {
         Task { await loadPlaylistAndPreparePlaybackThenStart() }
-        setupPeriodicPlayerTimeObserverForSubtitles()
         setupSyncNetworkingIfConfigured()
         setupBrokerIfConfigured()
     }
@@ -245,6 +253,7 @@ final class MediaPlayerViewModel: ObservableObject {
 
     func saveSettingsAndReload() {
         persist(userEditablePlaylistIdentifier, for: .playlistIdentifier)
+        persist(userEditableXOSApiEndpointBase, for: .xosApiEndpointBase)
         Task { await loadPlaylistAndPreparePlaybackThenStart() }
     }
 
@@ -409,6 +418,7 @@ final class MediaPlayerViewModel: ObservableObject {
         itemsToPlayInOrder.forEach { player.insert($0, after: nil) }
 
         addEndOfQueueObserverToLoop()
+        setupPeriodicPlayerTimeObserverForSubtitles()
     }
 
     private func removePlaybackObserversAndStop() {
@@ -732,14 +742,25 @@ struct MediaPlayerRootView: View {
         }
 #if os(tvOS)
         .fullScreenCover(isPresented: $viewModel.isShowingSettingsSheet) {
-            SettingsSheetView(
-                playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
-                isPlaybackMuted: $viewModel.isPlaybackMuted,
-                sessionIdentifier: viewModel.sessionId,
-                onSaveAndReload: { viewModel.saveSettingsAndReload() },
-                onClearCache: { viewModel.clearAllCachedData() },
-                extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
-            )
+            ZStack {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .ignoresSafeArea()
+
+                SettingsSheetView(
+                    playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
+                    isPlaybackMuted: $viewModel.isPlaybackMuted,
+                    sessionIdentifier: viewModel.sessionId,
+                    onSaveAndReload: { viewModel.saveSettingsAndReload() },
+                    onClearCache: { viewModel.clearAllCachedData() },
+                    extraContent: { SyncAndSubtitleSettings(viewModel: viewModel) }
+                )
+                .frame(maxWidth: 1180)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .padding(60)
+            }
         }
         .onChange(of: viewModel.isShowingSettingsSheet) { isPresented in
             if !isPresented {
@@ -753,6 +774,7 @@ struct MediaPlayerRootView: View {
                 let minWidth = min(1080, proxy.size.width)
                 SettingsSheetView(
                     playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                    xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
                     isPlaybackMuted: $viewModel.isPlaybackMuted,
                     sessionIdentifier: viewModel.sessionId,
                     onSaveAndReload: { viewModel.saveSettingsAndReload() },
@@ -765,6 +787,7 @@ struct MediaPlayerRootView: View {
 #else
             SettingsSheetView(
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
+                xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
                 isPlaybackMuted: $viewModel.isPlaybackMuted,
                 sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
@@ -787,11 +810,13 @@ struct MediaPlayerRootView: View {
     private var loadingStateView: some View {
         GeometryReader { proxy in
             ZStack {
+                Color.black.ignoresSafeArea()
+
                 VStack {
                     ProgressView()
                         .progressViewStyle(.circular)
                         .scaleEffect(2)
-                        .colorInvert()
+                        .tint(.gray)
                         .padding()
                     Text("Loading...")
                         .foregroundStyle(.white)
@@ -802,6 +827,10 @@ struct MediaPlayerRootView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { viewModel.toggleSettingsSheet() }
+#if os(tvOS)
+        .focusable(true)
+        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+#endif
     }
 
     private var noInternetStateView: some View {
@@ -824,11 +853,16 @@ struct MediaPlayerRootView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { viewModel.toggleSettingsSheet() }
+#if os(tvOS)
+        .focusable(true)
+        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+#endif
     }
 }
 
 struct SettingsSheetView<ExtraContent: View>: View {
     @Binding var playlistIdentifier: String
+    @Binding var xosApiEndpointBase: String
     @Binding var isPlaybackMuted: Bool
     let sessionIdentifier: String
     var onSaveAndReload: () -> Void
@@ -836,8 +870,9 @@ struct SettingsSheetView<ExtraContent: View>: View {
     var extraContent: () -> ExtraContent
     @Environment(\.dismiss) private var dismiss
 
-    init(playlistIdentifier: Binding<String>, isPlaybackMuted: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
+    init(playlistIdentifier: Binding<String>, xosApiEndpointBase: Binding<String>, isPlaybackMuted: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
         self._playlistIdentifier = playlistIdentifier
+        self._xosApiEndpointBase = xosApiEndpointBase
         self._isPlaybackMuted = isPlaybackMuted
         self.sessionIdentifier = sessionIdentifier
         self.onSaveAndReload = onSaveAndReload
@@ -850,6 +885,11 @@ struct SettingsSheetView<ExtraContent: View>: View {
             Form {
                 Section("Playlist Settings") {
                     TextField("Playlist ID", text: $playlistIdentifier)
+                        .autocorrectionDisabled(true)
+                        #if os(iOS)
+                        .autocapitalization(.none)
+                        #endif
+                    TextField("API endpoint base", text: $xosApiEndpointBase)
                         .autocorrectionDisabled(true)
                         #if os(iOS)
                         .autocapitalization(.none)
