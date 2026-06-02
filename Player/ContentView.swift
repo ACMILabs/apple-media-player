@@ -64,6 +64,9 @@ final class MediaPlayerViewModel: ObservableObject {
             persist(isPlaybackMuted, for: .playbackMuted)
         }
     }
+    @Published var videoControlsEnabled: Bool = false {
+        didSet { persist(videoControlsEnabled, for: .videoControlsEnabled) }
+    }
 
     // MARK: Subtitles + Sync Settings (moved from extension)
     @Published var showSubtitlesIfAvailable: Bool = false {
@@ -170,6 +173,7 @@ final class MediaPlayerViewModel: ObservableObject {
         case playlistIdentifier = "playlist.id"
         case xosApiEndpointBase = "xos.apiEndpointBase"
         case playbackMuted = "playback.muted"
+        case videoControlsEnabled = "video.controlsEnabled"
         case subtitlesEnabled = "subtitles.show"
         case subtitleFontSize = "subtitles.fontSize"
         case subtitleBold = "subtitles.bold"
@@ -199,6 +203,7 @@ final class MediaPlayerViewModel: ObservableObject {
         userEditablePlaylistIdentifier = defaults.string(forKey: namespacedKey(.playlistIdentifier)) ?? "1"
         userEditableXOSApiEndpointBase = defaults.string(forKey: namespacedKey(.xosApiEndpointBase)) ?? Self.defaultXOSApiEndpointBase
         isPlaybackMuted = defaults.object(forKey: namespacedKey(.playbackMuted)) as? Bool ?? false
+        videoControlsEnabled = defaults.object(forKey: namespacedKey(.videoControlsEnabled)) as? Bool ?? false
         showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? false
         subtitleFontPointSize = CGFloat(defaults.object(forKey: namespacedKey(.subtitleFontSize)) as? Int ?? 28)
         subtitleIsBold = defaults.object(forKey: namespacedKey(.subtitleBold)) as? Bool ?? false
@@ -751,6 +756,7 @@ struct MediaPlayerRootView: View {
                     playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
                     xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
                     isPlaybackMuted: $viewModel.isPlaybackMuted,
+                    videoControlsEnabled: $viewModel.videoControlsEnabled,
                     sessionIdentifier: viewModel.sessionId,
                     onSaveAndReload: { viewModel.saveSettingsAndReload() },
                     onClearCache: { viewModel.clearAllCachedData() },
@@ -776,6 +782,7 @@ struct MediaPlayerRootView: View {
                     playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
                     xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
                     isPlaybackMuted: $viewModel.isPlaybackMuted,
+                    videoControlsEnabled: $viewModel.videoControlsEnabled,
                     sessionIdentifier: viewModel.sessionId,
                     onSaveAndReload: { viewModel.saveSettingsAndReload() },
                     onClearCache: { viewModel.clearAllCachedData() },
@@ -789,6 +796,7 @@ struct MediaPlayerRootView: View {
                 playlistIdentifier: $viewModel.userEditablePlaylistIdentifier,
                 xosApiEndpointBase: $viewModel.userEditableXOSApiEndpointBase,
                 isPlaybackMuted: $viewModel.isPlaybackMuted,
+                videoControlsEnabled: $viewModel.videoControlsEnabled,
                 sessionIdentifier: viewModel.sessionId,
                 onSaveAndReload: { viewModel.saveSettingsAndReload() },
                 onClearCache: { viewModel.clearAllCachedData() },
@@ -864,16 +872,18 @@ struct SettingsSheetView<ExtraContent: View>: View {
     @Binding var playlistIdentifier: String
     @Binding var xosApiEndpointBase: String
     @Binding var isPlaybackMuted: Bool
+    @Binding var videoControlsEnabled: Bool
     let sessionIdentifier: String
     var onSaveAndReload: () -> Void
     var onClearCache: () -> Void
     var extraContent: () -> ExtraContent
     @Environment(\.dismiss) private var dismiss
 
-    init(playlistIdentifier: Binding<String>, xosApiEndpointBase: Binding<String>, isPlaybackMuted: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
+    init(playlistIdentifier: Binding<String>, xosApiEndpointBase: Binding<String>, isPlaybackMuted: Binding<Bool>, videoControlsEnabled: Binding<Bool>, sessionIdentifier: String, onSaveAndReload: @escaping () -> Void, onClearCache: @escaping () -> Void, extraContent: @escaping () -> ExtraContent = { EmptyView() as! ExtraContent }) {
         self._playlistIdentifier = playlistIdentifier
         self._xosApiEndpointBase = xosApiEndpointBase
         self._isPlaybackMuted = isPlaybackMuted
+        self._videoControlsEnabled = videoControlsEnabled
         self.sessionIdentifier = sessionIdentifier
         self.onSaveAndReload = onSaveAndReload
         self.onClearCache = onClearCache
@@ -895,6 +905,7 @@ struct SettingsSheetView<ExtraContent: View>: View {
                         .autocapitalization(.none)
                         #endif
                     Toggle("Mute playback", isOn: $isPlaybackMuted)
+                    Toggle("Show video controls", isOn: $videoControlsEnabled)
                     LabeledContent("Session ID") {
                         Text(sessionIdentifier)
                             .font(.caption.monospaced())
@@ -1153,10 +1164,10 @@ extension MediaPlayerRootView {
     var playerWithOverlays: some View {
         ZStack {
 #if os(macOS)
-            MacVideoSurface(player: viewModel.avQueuePlayer)
+            VideoSurface(player: viewModel.avQueuePlayer, controlsEnabled: viewModel.videoControlsEnabled)
                 .ignoresSafeArea()
 #else
-            VideoPlayer(player: viewModel.avQueuePlayer)
+            VideoSurface(player: viewModel.avQueuePlayer, controlsEnabled: viewModel.videoControlsEnabled)
                 .ignoresSafeArea()
 #endif
 
@@ -1167,10 +1178,16 @@ extension MediaPlayerRootView {
             }
         }
         .contentShape(Rectangle())
-        .onLongPressGesture { viewModel.toggleSettingsSheet() }
+        .onLongPressGesture {
+            guard !viewModel.videoControlsEnabled else { return }
+            viewModel.toggleSettingsSheet()
+        }
 #if os(macOS)
         .background(
-            MacSettingsShortcutHandler(isEnabled: !viewModel.isShowingSettingsSheet) {
+            MacSettingsShortcutHandler(
+                isEnabled: !viewModel.isShowingSettingsSheet,
+                allowsSpaceToOpenSettings: !viewModel.videoControlsEnabled
+            ) {
                 viewModel.openSettingsSheet()
             }
         )
@@ -1297,22 +1314,26 @@ struct SyncAndSubtitleSettings: View {
 #if os(macOS)
 private struct MacSettingsShortcutHandler: NSViewRepresentable {
     let isEnabled: Bool
+    let allowsSpaceToOpenSettings: Bool
     let onOpenSettings: () -> Void
 
     func makeNSView(context: Context) -> ShortcutHandlingView {
         let view = ShortcutHandlingView()
         view.onOpenSettings = onOpenSettings
         view.isEnabled = isEnabled
+        view.allowsSpaceToOpenSettings = allowsSpaceToOpenSettings
         return view
     }
 
     func updateNSView(_ nsView: ShortcutHandlingView, context: Context) {
         nsView.onOpenSettings = onOpenSettings
         nsView.isEnabled = isEnabled
+        nsView.allowsSpaceToOpenSettings = allowsSpaceToOpenSettings
     }
 
     final class ShortcutHandlingView: NSView {
         var isEnabled = true
+        var allowsSpaceToOpenSettings = true
         var onOpenSettings: () -> Void = {}
         private var keyDownMonitor: Any?
 
@@ -1337,7 +1358,7 @@ private struct MacSettingsShortcutHandler: NSViewRepresentable {
                 guard self.isEnabled, event.window === self.window else { return event }
                 guard event.modifierFlags.intersection([.command, .control, .option, .function]).isEmpty else { return event }
 
-                if Self.opensSettings(event) {
+                if Self.opensSettings(event, allowsSpace: self.allowsSpaceToOpenSettings) {
                     self.onOpenSettings()
                     return nil
                 }
@@ -1346,10 +1367,12 @@ private struct MacSettingsShortcutHandler: NSViewRepresentable {
             }
         }
 
-        private static func opensSettings(_ event: NSEvent) -> Bool {
+        private static func opensSettings(_ event: NSEvent, allowsSpace: Bool) -> Bool {
             switch event.keyCode {
-            case 36, 49:
+            case 36:
                 return true
+            case 49:
+                return allowsSpace
             default:
                 return event.charactersIgnoringModifiers?.lowercased() == "s"
             }
@@ -1357,12 +1380,13 @@ private struct MacSettingsShortcutHandler: NSViewRepresentable {
     }
 }
 
-struct MacVideoSurface: NSViewRepresentable {
+struct VideoSurface: NSViewRepresentable {
     let player: AVPlayer
+    let controlsEnabled: Bool
 
     func makeNSView(context: Context) -> AVPlayerView {
         let v = AVPlayerView()
-        v.controlsStyle = .none
+        v.controlsStyle = controlsEnabled ? .floating : .none
         v.showsFullScreenToggleButton = false
         v.updatesNowPlayingInfoCenter = false
         v.videoGravity = .resizeAspect
@@ -1372,6 +1396,27 @@ struct MacVideoSurface: NSViewRepresentable {
 
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         if nsView.player !== player { nsView.player = player }
+        nsView.controlsStyle = controlsEnabled ? .floating : .none
+    }
+}
+#else
+struct VideoSurface: UIViewControllerRepresentable {
+    let player: AVPlayer
+    let controlsEnabled: Bool
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.showsPlaybackControls = controlsEnabled
+        controller.videoGravity = .resizeAspect
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        if controller.player !== player {
+            controller.player = player
+        }
+        controller.showsPlaybackControls = controlsEnabled
     }
 }
 #endif
