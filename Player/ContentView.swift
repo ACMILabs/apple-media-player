@@ -37,6 +37,8 @@ struct CachedPlaylist: Codable {
 
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 
 // MARK: - View Model
@@ -1167,7 +1169,11 @@ extension MediaPlayerRootView {
             VideoSurface(player: viewModel.avQueuePlayer, controlsEnabled: viewModel.videoControlsEnabled)
                 .ignoresSafeArea()
 #else
-            VideoSurface(player: viewModel.avQueuePlayer, controlsEnabled: viewModel.videoControlsEnabled)
+            VideoSurface(
+                player: viewModel.avQueuePlayer,
+                controlsEnabled: viewModel.videoControlsEnabled,
+                onLongPress: { viewModel.openSettingsSheet() }
+            )
                 .ignoresSafeArea()
 #endif
 
@@ -1176,11 +1182,24 @@ extension MediaPlayerRootView {
                                     fontSize: viewModel.subtitleFontPointSize,
                                     isBold: viewModel.subtitleIsBold)
             }
+
+#if !os(macOS)
+            if !viewModel.videoControlsEnabled {
+                LongPressSettingsOverlay(
+                    isEnabled: true,
+                    onLongPress: { viewModel.openSettingsSheet() }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+            }
+#endif
         }
         .contentShape(Rectangle())
         .onLongPressGesture {
+#if os(macOS)
             guard !viewModel.videoControlsEnabled else { return }
-            viewModel.toggleSettingsSheet()
+#endif
+            viewModel.openSettingsSheet()
         }
 #if os(macOS)
         .background(
@@ -1400,23 +1419,120 @@ struct VideoSurface: NSViewRepresentable {
     }
 }
 #else
+struct LongPressSettingsOverlay: UIViewRepresentable {
+    let isEnabled: Bool
+    let onLongPress: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onLongPress: onLongPress, isEnabled: isEnabled)
+    }
+
+    func makeUIView(context: Context) -> OverlayView {
+        let view = OverlayView()
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.isEnabled = isEnabled
+
+        let longPressRecognizer = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleLongPress(_:))
+        )
+        longPressRecognizer.cancelsTouchesInView = false
+        view.addGestureRecognizer(longPressRecognizer)
+
+        return view
+    }
+
+    func updateUIView(_ uiView: OverlayView, context: Context) {
+        uiView.isEnabled = isEnabled
+        context.coordinator.isEnabled = isEnabled
+        context.coordinator.onLongPress = onLongPress
+    }
+
+    final class OverlayView: UIView {
+        var isEnabled = true
+
+        override var intrinsicContentSize: CGSize {
+            CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
+        }
+
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+            isEnabled && super.point(inside: point, with: event)
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var onLongPress: () -> Void
+        var isEnabled: Bool
+
+        init(onLongPress: @escaping () -> Void, isEnabled: Bool) {
+            self.onLongPress = onLongPress
+            self.isEnabled = isEnabled
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began, isEnabled else { return }
+            onLongPress()
+        }
+    }
+}
+
 struct VideoSurface: UIViewControllerRepresentable {
     let player: AVPlayer
     let controlsEnabled: Bool
+    let onLongPress: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onLongPress: onLongPress, controlsEnabled: controlsEnabled)
+    }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
         controller.showsPlaybackControls = controlsEnabled
         controller.videoGravity = .resizeAspect
+
+        let longPressRecognizer = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleLongPress(_:))
+        )
+        longPressRecognizer.delegate = context.coordinator
+        longPressRecognizer.cancelsTouchesInView = false
+        controller.view.addGestureRecognizer(longPressRecognizer)
+
         return controller
     }
 
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        context.coordinator.onLongPress = onLongPress
+        context.coordinator.controlsEnabled = controlsEnabled
+
         if controller.player !== player {
             controller.player = player
         }
         controller.showsPlaybackControls = controlsEnabled
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onLongPress: () -> Void
+        var controlsEnabled: Bool
+
+        init(onLongPress: @escaping () -> Void, controlsEnabled: Bool) {
+            self.onLongPress = onLongPress
+            self.controlsEnabled = controlsEnabled
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began else { return }
+            onLongPress()
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            true
+        }
     }
 }
 #endif
