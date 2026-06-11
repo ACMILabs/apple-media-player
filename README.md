@@ -231,3 +231,8 @@ Example:
 ```text
 3,45120
 ```
+
+## Privacy policy
+
+This app collects no data, and uses your own servers to source media.
+
