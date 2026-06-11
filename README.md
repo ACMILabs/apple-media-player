@@ -89,6 +89,13 @@ Playlist ID: 1
 API endpoint base: http://127.0.0.1:8000/
 ```
 
+The same example playlist can also be loaded from S3 with:
+
+```text
+Playlist ID: 1
+API endpoint base: https://acmi-public-api.s3.ap-southeast-2.amazonaws.com/media-player/
+```
+
 ## MQTT status publishing
 
 The app can publish player status to an MQTT broker. Configure it in `Settings > Message Broker`.
