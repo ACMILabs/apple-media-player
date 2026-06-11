@@ -74,6 +74,21 @@ Example:
 
 The player downloads each `resource` and `subtitles` URL into its local cache. If the API cannot be reached later, the player falls back to the cached playlist and cached media for the same playlist ID.
 
+### Local example API
+
+This repository includes a minimal local playlist API example in [`api/`](api/). It serves a sample playlist JSON response, MP4, SRT, and VTT file for development:
+
+```sh
+python3 api/serve.py
+```
+
+Then set:
+
+```text
+Playlist ID: 1
+API endpoint base: http://127.0.0.1:8000/
+```
+
 ## MQTT status publishing
 
 The app can publish player status to an MQTT broker. Configure it in `Settings > Message Broker`.

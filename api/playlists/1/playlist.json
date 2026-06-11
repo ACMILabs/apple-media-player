@@ -1,0 +1,11 @@
+{
+  "playlist_labels": [
+    {
+      "label": {
+        "id": 1
+      },
+      "resource": "http://127.0.0.1:8000/media/sample.mp4",
+      "subtitles": "http://127.0.0.1:8000/subtitles/sample.srt"
+    }
+  ]
+}
