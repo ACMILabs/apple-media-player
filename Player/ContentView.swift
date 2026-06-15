@@ -814,7 +814,7 @@ struct MediaPlayerRootView: View {
             }
         }
 #endif
-        .modifier(FullscreenWindowModifier())
+        .modifier(FullscreenWindowModifier(sessionId: sessionId))
     }
 
     private var loadingStateView: some View {
@@ -934,10 +934,197 @@ struct SettingsSheetView<ExtraContent: View>: View {
 // MARK: - Fullscreen Window Modifier (macOS)
 
 struct FullscreenWindowModifier: ViewModifier {
+    let sessionId: String
+
     func body(content: Content) -> some View {
         content
+            .background(WindowFrameAutosaveView(sessionId: sessionId))
     }
 }
+
+#if os(macOS)
+private struct WindowFrameAutosaveView: NSViewRepresentable {
+    let sessionId: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            context.coordinator.configure(window: view.window, sessionId: sessionId)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            context.coordinator.configure(window: nsView.window, sessionId: sessionId)
+        }
+    }
+
+    final class Coordinator {
+        private weak var configuredWindow: NSWindow?
+        private var configuredSessionId: String?
+        private var notificationTokens: [NSObjectProtocol] = []
+
+        deinit {
+            removeNotificationObservers()
+        }
+
+        func configure(window: NSWindow?, sessionId: String) {
+            guard let window else { return }
+            guard configuredWindow !== window || configuredSessionId != sessionId else { return }
+
+            removeNotificationObservers()
+            configuredWindow = window
+            configuredSessionId = sessionId
+
+            WindowPlacementStore.restorePlacement(for: window, sessionId: sessionId)
+            addNotificationObservers(for: window, sessionId: sessionId)
+        }
+
+        private func addNotificationObservers(for window: NSWindow, sessionId: String) {
+            let center = NotificationCenter.default
+            let names: [Notification.Name] = [
+                NSWindow.didMoveNotification,
+                NSWindow.didResizeNotification,
+                NSWindow.didChangeScreenNotification,
+                NSWindow.didEnterFullScreenNotification,
+                NSWindow.didExitFullScreenNotification,
+                NSWindow.willCloseNotification
+            ]
+
+            notificationTokens = names.map { name in
+                center.addObserver(forName: name, object: window, queue: .main) { [weak window] _ in
+                    guard let window else { return }
+                    WindowPlacementStore.savePlacement(for: window, sessionId: sessionId)
+                }
+            }
+        }
+
+        private func removeNotificationObservers() {
+            let center = NotificationCenter.default
+            notificationTokens.forEach { center.removeObserver($0) }
+            notificationTokens.removeAll()
+        }
+    }
+}
+
+private enum WindowPlacementStore {
+    private static let keyPrefix = "xos.player.windowPlacement"
+
+    static func restorePlacement(for window: NSWindow, sessionId: String) {
+        if let savedFrame = rect(forKey: frameKey(sessionId)) {
+            let targetScreen = screen(forDisplayId: integer(forKey: displayIdKey(sessionId)))
+            var restoredFrame = savedFrame
+
+            if let targetScreen, let savedScreenFrame = rect(forKey: screenFrameKey(sessionId)) {
+                restoredFrame.origin.x = targetScreen.frame.minX + (savedFrame.minX - savedScreenFrame.minX)
+                restoredFrame.origin.y = targetScreen.frame.minY + (savedFrame.minY - savedScreenFrame.minY)
+                restoredFrame = frame(restoredFrame, constrainedTo: targetScreen.frame)
+            } else if NSScreen.screens.allSatisfy({ !$0.frame.intersects(savedFrame) }),
+                      let fallbackScreen = NSScreen.main ?? NSScreen.screens.first {
+                restoredFrame = frame(savedFrame, constrainedTo: fallbackScreen.frame)
+            }
+
+            window.setFrame(restoredFrame, display: true)
+        }
+
+        guard UserDefaults.standard.bool(forKey: isFullScreenKey(sessionId)),
+              !window.styleMask.contains(.fullScreen) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak window] in
+            guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            window.toggleFullScreen(nil)
+        }
+    }
+
+    static func savePlacement(for window: NSWindow, sessionId: String) {
+        let defaults = UserDefaults.standard
+        defaults.set(window.styleMask.contains(.fullScreen), forKey: isFullScreenKey(sessionId))
+
+        if !window.styleMask.contains(.fullScreen) {
+            defaults.set(NSStringFromRect(window.frame), forKey: frameKey(sessionId))
+        }
+
+        guard let screen = window.screen else { return }
+        defaults.set(NSStringFromRect(screen.frame), forKey: screenFrameKey(sessionId))
+
+        if let displayId = displayId(for: screen) {
+            defaults.set(displayId, forKey: displayIdKey(sessionId))
+        }
+    }
+
+    private static func frame(_ frame: NSRect, constrainedTo screenFrame: NSRect) -> NSRect {
+        var constrainedFrame = frame
+        constrainedFrame.size.width = min(constrainedFrame.width, screenFrame.width)
+        constrainedFrame.size.height = min(constrainedFrame.height, screenFrame.height)
+
+        if constrainedFrame.maxX > screenFrame.maxX {
+            constrainedFrame.origin.x = screenFrame.maxX - constrainedFrame.width
+        }
+        if constrainedFrame.minX < screenFrame.minX {
+            constrainedFrame.origin.x = screenFrame.minX
+        }
+        if constrainedFrame.maxY > screenFrame.maxY {
+            constrainedFrame.origin.y = screenFrame.maxY - constrainedFrame.height
+        }
+        if constrainedFrame.minY < screenFrame.minY {
+            constrainedFrame.origin.y = screenFrame.minY
+        }
+
+        return constrainedFrame
+    }
+
+    private static func screen(forDisplayId displayId: Int?) -> NSScreen? {
+        guard let displayId else { return nil }
+        return NSScreen.screens.first { self.displayId(for: $0) == displayId }
+    }
+
+    private static func displayId(for screen: NSScreen) -> Int? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return (screen.deviceDescription[key] as? NSNumber)?.intValue
+    }
+
+    private static func rect(forKey key: String) -> NSRect? {
+        guard let value = UserDefaults.standard.string(forKey: key) else { return nil }
+        let rect = NSRectFromString(value)
+        return rect.isEmpty ? nil : rect
+    }
+
+    private static func integer(forKey key: String) -> Int? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: key) != nil else { return nil }
+        return defaults.integer(forKey: key)
+    }
+
+    private static func frameKey(_ sessionId: String) -> String {
+        "\(keyPrefix).\(sessionId).frame"
+    }
+
+    private static func screenFrameKey(_ sessionId: String) -> String {
+        "\(keyPrefix).\(sessionId).screenFrame"
+    }
+
+    private static func displayIdKey(_ sessionId: String) -> String {
+        "\(keyPrefix).\(sessionId).displayId"
+    }
+
+    private static func isFullScreenKey(_ sessionId: String) -> String {
+        "\(keyPrefix).\(sessionId).isFullScreen"
+    }
+}
+#else
+private struct WindowFrameAutosaveView: View {
+    let sessionId: String
+
+    var body: some View {
+        EmptyView()
+    }
+}
+#endif
 
 import Network
 
