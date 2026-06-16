@@ -983,6 +983,11 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
 
             WindowPlacementStore.restorePlacement(for: window, sessionId: sessionId)
             addNotificationObservers(for: window, sessionId: sessionId)
+
+            DispatchQueue.main.async { [weak window] in
+                guard let window else { return }
+                WindowPlacementStore.savePlacement(for: window, sessionId: sessionId)
+            }
         }
 
         private func addNotificationObservers(for window: NSWindow, sessionId: String) {

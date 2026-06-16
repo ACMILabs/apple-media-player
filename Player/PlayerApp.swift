@@ -23,6 +23,9 @@ struct PlayerApp: App {
                 .onAppear { NSApp.activate(ignoringOtherApps: true) }
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            PlayerWindowCommands()
+        }
 #else
         WindowGroup {
             SessionWindowRootView()
@@ -45,6 +48,7 @@ final class SessionRestoreCoordinator {
     private(set) var isTerminating = false
     private var initialSavedSessionCount = 0
     private var expectedSessionIdsForLaunch: [String] = []
+    private var pendingNewSessionIds: [String] = []
     private var activeSessionIds: [String] = []
 
     private init() {}
@@ -58,8 +62,16 @@ final class SessionRestoreCoordinator {
 
     func claimSessionId(fallback: String) -> String {
         prepareLaunchStateIfNeeded()
+        if !pendingNewSessionIds.isEmpty {
+            return pendingNewSessionIds.removeFirst()
+        }
         guard !expectedSessionIdsForLaunch.isEmpty else { return fallback }
         return expectedSessionIdsForLaunch.removeFirst()
+    }
+
+    func openNewWindow(openWindow: OpenWindowAction) {
+        pendingNewSessionIds.append(UUID().uuidString.lowercased())
+        openWindow(id: SessionWindowRootView.windowGroupID)
     }
 
     func markSessionAsRestored(_ sessionId: String) {
@@ -115,29 +127,39 @@ struct SessionWindowRootView: View {
     @State private var generatedSessionId = UUID().uuidString.lowercased()
     @Environment(\.openWindow) private var openWindow
 
-    private var activeSessionId: String {
-        persistedSessionId.isEmpty ? generatedSessionId : persistedSessionId
-    }
-
     var body: some View {
-        MediaPlayerRootView(sessionId: activeSessionId)
-            .id(activeSessionId)
-            .onAppear {
-                DispatchQueue.main.async {
-                    if persistedSessionId.isEmpty {
+        Group {
+            if persistedSessionId.isEmpty {
+                Color.black
+                    .onAppear {
                         persistedSessionId = SessionRestoreCoordinator.shared.claimSessionId(fallback: generatedSessionId)
-                    } else {
-                        SessionRestoreCoordinator.shared.markSessionAsRestored(persistedSessionId)
                     }
+            } else {
+                MediaPlayerRootView(sessionId: persistedSessionId)
+                    .id(persistedSessionId)
+                    .onAppear {
+                        SessionRestoreCoordinator.shared.markSessionAsRestored(persistedSessionId)
+                        SessionRestoreCoordinator.shared.registerActiveSession(persistedSessionId)
+                        SessionRestoreCoordinator.shared.restoreAdditionalWindowsIfNeeded(openWindow: openWindow)
+                    }
+                    .onDisappear {
+                        SessionRestoreCoordinator.shared.unregisterActiveSession(persistedSessionId)
+                    }
+            }
+        }
+    }
+}
 
-                    SessionRestoreCoordinator.shared.registerActiveSession(persistedSessionId)
-                    SessionRestoreCoordinator.shared.restoreAdditionalWindowsIfNeeded(openWindow: openWindow)
-                }
+struct PlayerWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Window") {
+                SessionRestoreCoordinator.shared.openNewWindow(openWindow: openWindow)
             }
-            .onDisappear {
-                guard !persistedSessionId.isEmpty else { return }
-                SessionRestoreCoordinator.shared.unregisterActiveSession(persistedSessionId)
-            }
+            .keyboardShortcut("n", modifiers: .command)
+        }
     }
 }
 
