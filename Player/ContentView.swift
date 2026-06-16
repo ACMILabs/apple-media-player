@@ -15,6 +15,9 @@
 import SwiftUI
 import AVKit
 import Combine
+#if os(macOS)
+import OSLog
+#endif
 
 // MARK: - Models
 
@@ -943,6 +946,8 @@ struct FullscreenWindowModifier: ViewModifier {
 }
 
 #if os(macOS)
+private let windowPlacementLogger = Logger(subsystem: "au.net.acmi.ACMI-Media-Player", category: "WindowPlacement")
+
 private struct WindowFrameAutosaveView: NSViewRepresentable {
     let sessionId: String
 
@@ -951,7 +956,10 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
+        let view = WindowTrackingView(frame: .zero)
+        view.onWindowChange = { [weak coordinator = context.coordinator, sessionId] window in
+            coordinator?.configure(window: window, sessionId: sessionId)
+        }
         DispatchQueue.main.async {
             context.coordinator.configure(window: view.window, sessionId: sessionId)
         }
@@ -959,8 +967,22 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        if let trackingView = nsView as? WindowTrackingView {
+            trackingView.onWindowChange = { [weak coordinator = context.coordinator, sessionId] window in
+                coordinator?.configure(window: window, sessionId: sessionId)
+            }
+        }
         DispatchQueue.main.async {
             context.coordinator.configure(window: nsView.window, sessionId: sessionId)
+        }
+    }
+
+    final class WindowTrackingView: NSView {
+        var onWindowChange: (NSWindow?) -> Void = { _ in }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onWindowChange(window)
         }
     }
 
@@ -981,12 +1003,15 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
             configuredWindow = window
             configuredSessionId = sessionId
 
-            WindowPlacementStore.restorePlacement(for: window, sessionId: sessionId)
+            window.tabbingMode = .disallowed
+            windowPlacementLogger.notice("configure session=\(sessionId, privacy: .public) windowFrame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public) isFullScreen=\(window.styleMask.contains(.fullScreen), privacy: .public)")
+            let hadSavedPlacement = WindowPlacementStore.restorePlacement(for: window, sessionId: sessionId)
             addNotificationObservers(for: window, sessionId: sessionId)
 
+            guard !hadSavedPlacement else { return }
             DispatchQueue.main.async { [weak window] in
                 guard let window else { return }
-                WindowPlacementStore.savePlacement(for: window, sessionId: sessionId)
+                WindowPlacementStore.savePlacement(for: window, sessionId: sessionId, reason: "migrationSnapshot")
             }
         }
 
@@ -1004,7 +1029,7 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
             notificationTokens = names.map { name in
                 center.addObserver(forName: name, object: window, queue: .main) { [weak window] _ in
                     guard let window else { return }
-                    WindowPlacementStore.savePlacement(for: window, sessionId: sessionId)
+                    WindowPlacementStore.savePlacement(for: window, sessionId: sessionId, reason: name.rawValue)
                 }
             }
         }
@@ -1019,47 +1044,90 @@ private struct WindowFrameAutosaveView: NSViewRepresentable {
 
 private enum WindowPlacementStore {
     private static let keyPrefix = "xos.player.windowPlacement"
+    private static var sessionsWithSuppressedSaves = Set<String>()
 
-    static func restorePlacement(for window: NSWindow, sessionId: String) {
-        if let savedFrame = rect(forKey: frameKey(sessionId)) {
-            let targetScreen = screen(forDisplayId: integer(forKey: displayIdKey(sessionId)))
+    @discardableResult
+    static func restorePlacement(for window: NSWindow, sessionId: String) -> Bool {
+        let hadSavedPlacement = UserDefaults.standard.object(forKey: frameKey(sessionId)) != nil
+        let savedFrame = rect(forKey: frameKey(sessionId))
+        let savedScreenFrame = rect(forKey: screenFrameKey(sessionId))
+        let savedDisplayId = integer(forKey: displayIdKey(sessionId))
+        let savedFullScreen = UserDefaults.standard.bool(forKey: isFullScreenKey(sessionId))
+
+        windowPlacementLogger.notice("restore begin session=\(sessionId, privacy: .public) hadSaved=\(hadSavedPlacement, privacy: .public) savedFrame=\(describe(savedFrame), privacy: .public) savedScreenFrame=\(describe(savedScreenFrame), privacy: .public) savedDisplayId=\(String(describing: savedDisplayId), privacy: .public) savedFullScreen=\(savedFullScreen, privacy: .public) screens=\(describeScreens(), privacy: .public)")
+
+        let targetScreen = screen(forDisplayId: savedDisplayId)
+        var restoredFullScreenFrame: NSRect?
+
+        if let savedFrame {
             var restoredFrame = savedFrame
 
-            if let targetScreen, let savedScreenFrame = rect(forKey: screenFrameKey(sessionId)) {
+            if let targetScreen, let savedScreenFrame {
                 restoredFrame.origin.x = targetScreen.frame.minX + (savedFrame.minX - savedScreenFrame.minX)
                 restoredFrame.origin.y = targetScreen.frame.minY + (savedFrame.minY - savedScreenFrame.minY)
                 restoredFrame = frame(restoredFrame, constrainedTo: targetScreen.frame)
+                windowPlacementLogger.notice("restore mapped session=\(sessionId, privacy: .public) targetScreen=\(describe(targetScreen), privacy: .public) restoredFrame=\(describe(restoredFrame), privacy: .public)")
             } else if NSScreen.screens.allSatisfy({ !$0.frame.intersects(savedFrame) }),
                       let fallbackScreen = NSScreen.main ?? NSScreen.screens.first {
                 restoredFrame = frame(savedFrame, constrainedTo: fallbackScreen.frame)
+                windowPlacementLogger.notice("restore fallback session=\(sessionId, privacy: .public) fallbackScreen=\(describe(fallbackScreen), privacy: .public) restoredFrame=\(describe(restoredFrame), privacy: .public)")
+            } else {
+                windowPlacementLogger.notice("restore direct session=\(sessionId, privacy: .public) restoredFrame=\(describe(restoredFrame), privacy: .public)")
             }
 
-            window.setFrame(restoredFrame, display: true)
+            restoredFullScreenFrame = restoredFrame
+            if !savedFullScreen, !window.styleMask.contains(.fullScreen) {
+                window.setFrame(restoredFrame, display: true)
+            }
+            windowPlacementLogger.notice("restore applied session=\(sessionId, privacy: .public) windowFrame=\(describe(window.frame), privacy: .public) windowScreen=\(describe(window.screen), privacy: .public)")
         }
 
-        guard UserDefaults.standard.bool(forKey: isFullScreenKey(sessionId)),
-              !window.styleMask.contains(.fullScreen) else { return }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak window] in
-            guard let window, !window.styleMask.contains(.fullScreen) else { return }
-            window.toggleFullScreen(nil)
+        guard savedFullScreen else {
+            windowPlacementLogger.notice("restore fullscreen skipped session=\(sessionId, privacy: .public) savedFullScreen=\(savedFullScreen, privacy: .public) currentlyFullScreen=\(window.styleMask.contains(.fullScreen), privacy: .public)")
+            return hadSavedPlacement
         }
+
+        FullScreenRestoreQueue.enqueue(window: window, sessionId: sessionId, restoredFrame: restoredFullScreenFrame)
+        return hadSavedPlacement
     }
 
-    static func savePlacement(for window: NSWindow, sessionId: String) {
-        let defaults = UserDefaults.standard
-        defaults.set(window.styleMask.contains(.fullScreen), forKey: isFullScreenKey(sessionId))
-
-        if !window.styleMask.contains(.fullScreen) {
-            defaults.set(NSStringFromRect(window.frame), forKey: frameKey(sessionId))
+    static func savePlacement(for window: NSWindow, sessionId: String, reason: String) {
+        guard !sessionsWithSuppressedSaves.contains(sessionId) else {
+            windowPlacementLogger.notice("save suppressed session=\(sessionId, privacy: .public) reason=\(reason, privacy: .public) frame=\(describe(window.frame), privacy: .public) screen=\(describe(window.screen), privacy: .public) isFullScreen=\(window.styleMask.contains(.fullScreen), privacy: .public)")
+            return
         }
 
-        guard let screen = window.screen else { return }
+        let defaults = UserDefaults.standard
+        let isFullScreen = window.styleMask.contains(.fullScreen)
+        defaults.set(isFullScreen, forKey: isFullScreenKey(sessionId))
+        guard !isFullScreen else {
+            windowPlacementLogger.notice("save fullscreen-only session=\(sessionId, privacy: .public) reason=\(reason, privacy: .public) frame=\(describe(window.frame), privacy: .public) screen=\(describe(window.screen), privacy: .public)")
+            return
+        }
+
+        defaults.set(NSStringFromRect(window.frame), forKey: frameKey(sessionId))
+        guard let screen = window.screen else {
+            windowPlacementLogger.notice("save no-screen session=\(sessionId, privacy: .public) reason=\(reason, privacy: .public) frame=\(describe(window.frame), privacy: .public)")
+            return
+        }
         defaults.set(NSStringFromRect(screen.frame), forKey: screenFrameKey(sessionId))
 
         if let displayId = displayId(for: screen) {
             defaults.set(displayId, forKey: displayIdKey(sessionId))
+            windowPlacementLogger.notice("save placement session=\(sessionId, privacy: .public) reason=\(reason, privacy: .public) frame=\(describe(window.frame), privacy: .public) screen=\(describe(screen), privacy: .public) displayId=\(displayId, privacy: .public)")
+        } else {
+            windowPlacementLogger.notice("save placement no-display-id session=\(sessionId, privacy: .public) reason=\(reason, privacy: .public) frame=\(describe(window.frame), privacy: .public) screen=\(describe(screen), privacy: .public)")
         }
+    }
+
+    static func suppressSaves(for sessionId: String) {
+        sessionsWithSuppressedSaves.insert(sessionId)
+        windowPlacementLogger.notice("save suppression begin session=\(sessionId, privacy: .public)")
+    }
+
+    static func resumeSaves(for sessionId: String) {
+        sessionsWithSuppressedSaves.remove(sessionId)
+        windowPlacementLogger.notice("save suppression end session=\(sessionId, privacy: .public)")
     }
 
     private static func frame(_ frame: NSRect, constrainedTo screenFrame: NSRect) -> NSRect {
@@ -1093,6 +1161,21 @@ private enum WindowPlacementStore {
         return (screen.deviceDescription[key] as? NSNumber)?.intValue
     }
 
+    static func describe(_ rect: NSRect?) -> String {
+        guard let rect else { return "nil" }
+        return "x:\(Int(rect.origin.x)) y:\(Int(rect.origin.y)) w:\(Int(rect.width)) h:\(Int(rect.height))"
+    }
+
+    static func describe(_ screen: NSScreen?) -> String {
+        guard let screen else { return "nil" }
+        let displayId = displayId(for: screen).map(String.init) ?? "nil"
+        return "display:\(displayId) frame:{\(describe(screen.frame))} visible:{\(describe(screen.visibleFrame))}"
+    }
+
+    private static func describeScreens() -> String {
+        NSScreen.screens.map { describe($0) }.joined(separator: " | ")
+    }
+
     private static func rect(forKey key: String) -> NSRect? {
         guard let value = UserDefaults.standard.string(forKey: key) else { return nil }
         let rect = NSRectFromString(value)
@@ -1119,6 +1202,132 @@ private enum WindowPlacementStore {
 
     private static func isFullScreenKey(_ sessionId: String) -> String {
         "\(keyPrefix).\(sessionId).isFullScreen"
+    }
+}
+
+@MainActor
+private enum FullScreenRestoreQueue {
+    private final class PendingRestore {
+        weak var window: NSWindow?
+        let sessionId: String
+        let restoredFrame: NSRect?
+
+        init(window: NSWindow, sessionId: String, restoredFrame: NSRect?) {
+            self.window = window
+            self.sessionId = sessionId
+            self.restoredFrame = restoredFrame
+        }
+    }
+
+    private static var pendingRestores: [String: PendingRestore] = [:]
+    private static var hasScheduledBatch = false
+
+    static func enqueue(window: NSWindow, sessionId: String, restoredFrame: NSRect?) {
+        pendingRestores[sessionId] = PendingRestore(window: window, sessionId: sessionId, restoredFrame: restoredFrame)
+        windowPlacementLogger.notice("fullscreen batch enqueue session=\(sessionId, privacy: .public) restoredFrame=\(WindowPlacementStore.describe(restoredFrame), privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public) pending=\(pendingRestores.count, privacy: .public)")
+
+        guard !hasScheduledBatch else { return }
+        hasScheduledBatch = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            processBatch()
+        }
+    }
+
+    private static func processBatch() {
+        hasScheduledBatch = false
+        let restores = pendingRestores.values
+            .compactMap { restore -> PendingRestore? in
+                guard restore.window != nil else {
+                    windowPlacementLogger.notice("fullscreen batch drop missing-window session=\(restore.sessionId, privacy: .public)")
+                    return nil
+                }
+                return restore
+            }
+            .sorted { $0.sessionId < $1.sessionId }
+        pendingRestores.removeAll()
+
+        guard !restores.isEmpty else {
+            windowPlacementLogger.notice("fullscreen batch skipped empty")
+            return
+        }
+
+        let sessionIds = restores.map(\.sessionId)
+        sessionIds.forEach { WindowPlacementStore.suppressSaves(for: $0) }
+        windowPlacementLogger.notice("fullscreen batch begin sessions=\(sessionIds.joined(separator: ","), privacy: .public) windows=\(describeAppWindows(), privacy: .public)")
+
+        restores.forEach { restore in
+            guard let window = restore.window else { return }
+            if window.styleMask.contains(.fullScreen) {
+                windowPlacementLogger.notice("fullscreen batch exit session=\(restore.sessionId, privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+                window.toggleFullScreen(nil)
+            } else {
+                windowPlacementLogger.notice("fullscreen batch exit skipped-not-fullscreen session=\(restore.sessionId, privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+            moveBatch(restores)
+        }
+    }
+
+    private static func moveBatch(_ restores: [PendingRestore]) {
+        restores.forEach { restore in
+            guard let window = restore.window else {
+                windowPlacementLogger.notice("fullscreen batch move skipped missing-window session=\(restore.sessionId, privacy: .public)")
+                return
+            }
+
+            window.tabbingMode = .disallowed
+            if let restoredFrame = restore.restoredFrame {
+                window.setFrame(restoredFrame, display: true)
+                windowPlacementLogger.notice("fullscreen batch move session=\(restore.sessionId, privacy: .public) restoredFrame=\(WindowPlacementStore.describe(restoredFrame), privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+            } else {
+                windowPlacementLogger.notice("fullscreen batch move skipped no-frame session=\(restore.sessionId, privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            enterFullScreenBatch(restores)
+        }
+    }
+
+    private static func enterFullScreenBatch(_ restores: [PendingRestore]) {
+        restores.enumerated().forEach { index, restore in
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.6)) {
+                guard let window = restore.window else {
+                    windowPlacementLogger.notice("fullscreen batch enter skipped missing-window session=\(restore.sessionId, privacy: .public)")
+                    return
+                }
+
+                if !window.styleMask.contains(.fullScreen) {
+                    windowPlacementLogger.notice("fullscreen batch enter session=\(restore.sessionId, privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+                    window.toggleFullScreen(nil)
+                } else {
+                    windowPlacementLogger.notice("fullscreen batch enter skipped-already-fullscreen session=\(restore.sessionId, privacy: .public) frame=\(WindowPlacementStore.describe(window.frame), privacy: .public) screen=\(WindowPlacementStore.describe(window.screen), privacy: .public)")
+                }
+            }
+        }
+
+        let settleDelay = 1.8 + (Double(restores.count) * 0.6)
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
+            activateAllPlayerWindows(reason: "fullscreen batch activate-all", sessionIds: restores.map(\.sessionId))
+            restores.forEach { WindowPlacementStore.resumeSaves(for: $0.sessionId) }
+        }
+    }
+
+    private static func activateAllPlayerWindows(reason: String, sessionIds: [String]) {
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.windows.forEach { window in
+            window.orderFrontRegardless()
+        }
+        windowPlacementLogger.notice("\(reason, privacy: .public) sessions=\(sessionIds.joined(separator: ","), privacy: .public) windows=\(describeAppWindows(), privacy: .public)")
+    }
+
+    private static func describeAppWindows() -> String {
+        NSApp.windows.map { window in
+            "frame:{\(WindowPlacementStore.describe(window.frame))} screen:{\(WindowPlacementStore.describe(window.screen))} fullscreen:\(window.styleMask.contains(.fullScreen)) visible:\(window.isVisible)"
+        }
+        .joined(separator: " | ")
     }
 }
 #else
