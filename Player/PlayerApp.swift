@@ -7,6 +7,10 @@
 
 import SwiftUI
 import CoreData
+#if os(macOS)
+import AppKit
+import OSLog
+#endif
 
 @main
 struct PlayerApp: App {
@@ -23,6 +27,9 @@ struct PlayerApp: App {
                 .onAppear { NSApp.activate(ignoringOtherApps: true) }
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            PlayerWindowCommands()
+        }
 #else
         WindowGroup {
             SessionWindowRootView()
@@ -33,6 +40,8 @@ struct PlayerApp: App {
 }
 
 #if os(macOS)
+private let playerWindowLogger = Logger(subsystem: "au.net.acmi.ACMI-Media-Player", category: "WindowSession")
+
 @MainActor
 final class SessionRestoreCoordinator {
     static let shared = SessionRestoreCoordinator()
@@ -45,6 +54,7 @@ final class SessionRestoreCoordinator {
     private(set) var isTerminating = false
     private var initialSavedSessionCount = 0
     private var expectedSessionIdsForLaunch: [String] = []
+    private var pendingNewSessionIds: [String] = []
     private var activeSessionIds: [String] = []
 
     private init() {}
@@ -54,12 +64,30 @@ final class SessionRestoreCoordinator {
         expectedSessionIdsForLaunch = defaults.stringArray(forKey: savedSessionsKey) ?? []
         initialSavedSessionCount = max(1, expectedSessionIdsForLaunch.count)
         hasPreparedLaunchState = true
+        playerWindowLogger.notice("prepare launch savedSessions=\(self.expectedSessionIdsForLaunch.joined(separator: ","), privacy: .public) initialCount=\(self.initialSavedSessionCount, privacy: .public)")
     }
 
     func claimSessionId(fallback: String) -> String {
         prepareLaunchStateIfNeeded()
-        guard !expectedSessionIdsForLaunch.isEmpty else { return fallback }
-        return expectedSessionIdsForLaunch.removeFirst()
+        if !pendingNewSessionIds.isEmpty {
+            let sessionId = pendingNewSessionIds.removeFirst()
+            playerWindowLogger.notice("claim session pendingNew session=\(sessionId, privacy: .public)")
+            return sessionId
+        }
+        guard !expectedSessionIdsForLaunch.isEmpty else {
+            playerWindowLogger.notice("claim session fallback session=\(fallback, privacy: .public)")
+            return fallback
+        }
+        let sessionId = expectedSessionIdsForLaunch.removeFirst()
+        playerWindowLogger.notice("claim session restored session=\(sessionId, privacy: .public) remaining=\(self.expectedSessionIdsForLaunch.joined(separator: ","), privacy: .public)")
+        return sessionId
+    }
+
+    func openNewWindow(openWindow: OpenWindowAction) {
+        let sessionId = UUID().uuidString.lowercased()
+        pendingNewSessionIds.append(sessionId)
+        playerWindowLogger.notice("open new window queued session=\(sessionId, privacy: .public)")
+        openWindow(id: SessionWindowRootView.windowGroupID)
     }
 
     func markSessionAsRestored(_ sessionId: String) {
@@ -67,22 +95,26 @@ final class SessionRestoreCoordinator {
         if let idx = expectedSessionIdsForLaunch.firstIndex(of: sessionId) {
             expectedSessionIdsForLaunch.remove(at: idx)
         }
+        playerWindowLogger.notice("mark restored session=\(sessionId, privacy: .public) remaining=\(self.expectedSessionIdsForLaunch.joined(separator: ","), privacy: .public)")
     }
 
     func registerActiveSession(_ sessionId: String) {
         guard !activeSessionIds.contains(sessionId) else { return }
         activeSessionIds.append(sessionId)
+        playerWindowLogger.notice("register active session=\(sessionId, privacy: .public) active=\(self.activeSessionIds.joined(separator: ","), privacy: .public)")
         persistActiveSessions()
     }
 
     func unregisterActiveSession(_ sessionId: String) {
         guard !isTerminating else { return }
         activeSessionIds.removeAll { $0 == sessionId }
+        playerWindowLogger.notice("unregister active session=\(sessionId, privacy: .public) active=\(self.activeSessionIds.joined(separator: ","), privacy: .public)")
         persistActiveSessions()
     }
 
     func markApplicationTerminating() {
         isTerminating = true
+        playerWindowLogger.notice("application terminating active=\(self.activeSessionIds.joined(separator: ","), privacy: .public)")
     }
 
     func restoreAdditionalWindowsIfNeeded(openWindow: OpenWindowAction) {
@@ -93,12 +125,16 @@ final class SessionRestoreCoordinator {
         let targetCount = initialSavedSessionCount
         guard targetCount > 1 else { return }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             guard let self else { return }
             let missingWindowCount = max(0, targetCount - self.activeSessionIds.count)
+            playerWindowLogger.notice("restore additional target=\(targetCount, privacy: .public) activeCount=\(self.activeSessionIds.count, privacy: .public) missing=\(missingWindowCount, privacy: .public)")
             guard missingWindowCount > 0 else { return }
-            for _ in 0..<missingWindowCount {
-                openWindow(id: SessionWindowRootView.windowGroupID)
+            for index in 0..<missingWindowCount {
+                DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 2.5)) {
+                    playerWindowLogger.notice("restore additional opening index=\(index, privacy: .public) of=\(missingWindowCount, privacy: .public)")
+                    openWindow(id: SessionWindowRootView.windowGroupID)
+                }
             }
         }
     }
@@ -115,33 +151,47 @@ struct SessionWindowRootView: View {
     @State private var generatedSessionId = UUID().uuidString.lowercased()
     @Environment(\.openWindow) private var openWindow
 
-    private var activeSessionId: String {
-        persistedSessionId.isEmpty ? generatedSessionId : persistedSessionId
-    }
-
     var body: some View {
-        MediaPlayerRootView(sessionId: activeSessionId)
-            .id(activeSessionId)
-            .onAppear {
-                DispatchQueue.main.async {
-                    if persistedSessionId.isEmpty {
+        Group {
+            if persistedSessionId.isEmpty {
+                Color.black
+                    .onAppear {
                         persistedSessionId = SessionRestoreCoordinator.shared.claimSessionId(fallback: generatedSessionId)
-                    } else {
-                        SessionRestoreCoordinator.shared.markSessionAsRestored(persistedSessionId)
                     }
+            } else {
+                MediaPlayerRootView(sessionId: persistedSessionId)
+                    .id(persistedSessionId)
+                    .onAppear {
+                        SessionRestoreCoordinator.shared.markSessionAsRestored(persistedSessionId)
+                        SessionRestoreCoordinator.shared.registerActiveSession(persistedSessionId)
+                        SessionRestoreCoordinator.shared.restoreAdditionalWindowsIfNeeded(openWindow: openWindow)
+                    }
+                    .onDisappear {
+                        SessionRestoreCoordinator.shared.unregisterActiveSession(persistedSessionId)
+                    }
+            }
+        }
+    }
+}
 
-                    SessionRestoreCoordinator.shared.registerActiveSession(persistedSessionId)
-                    SessionRestoreCoordinator.shared.restoreAdditionalWindowsIfNeeded(openWindow: openWindow)
-                }
+struct PlayerWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Window") {
+                SessionRestoreCoordinator.shared.openNewWindow(openWindow: openWindow)
             }
-            .onDisappear {
-                guard !persistedSessionId.isEmpty else { return }
-                SessionRestoreCoordinator.shared.unregisterActiveSession(persistedSessionId)
-            }
+            .keyboardShortcut("n", modifiers: .command)
+        }
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         SessionRestoreCoordinator.shared.markApplicationTerminating()
         return .terminateNow
