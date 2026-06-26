@@ -4,11 +4,16 @@ A macOS/iOS/tvOS media player for cached, looping playlist playback with optiona
 
 <img src="screenshot.png" width="100%" />
 
+[![Download on the App Store](https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg)](https://apps.apple.com/us/app/acmi-media-player/id6754896867?mt=12)<br />
+[![TestFlight](https://img.shields.io/badge/TestFlight-Join_beta-0A84FF?logo=apple&logoColor=white)](https://testflight.apple.com/join/jJNvBDMx)
+
 ## Source
 
 Ported from the Python/VLC media player: https://github.com/ACMILabs/media-player
 
-## Test Flight
+## App Store and Test Flight
+
+Apple App Store: https://apps.apple.com/us/app/acmi-media-player/id6754896867?mt=12
 
 Apple Test Flight: https://testflight.apple.com/join/jJNvBDMx
 
