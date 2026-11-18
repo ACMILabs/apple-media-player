@@ -83,6 +83,14 @@ final class MediaPlayerViewModel: ObservableObject {
     @Published var subtitleIsBold: Bool = false {
         didSet { persist(subtitleIsBold, for: .subtitleBold) }
     }
+    static let defaultSubtitlePosition = CGPoint(x: 0.5, y: 1)
+    @Published var subtitlePosition: CGPoint = defaultSubtitlePosition {
+        didSet { persist([Double(subtitlePosition.x), Double(subtitlePosition.y)], for: .subtitlePosition) }
+    }
+
+    func resetSubtitlePosition() {
+        subtitlePosition = Self.defaultSubtitlePosition
+    }
 
     @Published var isThisDeviceTheSyncServer: Bool = false {
         didSet {
@@ -182,6 +190,7 @@ final class MediaPlayerViewModel: ObservableObject {
         case subtitlesEnabled = "subtitles.show"
         case subtitleFontSize = "subtitles.fontSize"
         case subtitleBold = "subtitles.bold"
+        case subtitlePosition = "subtitles.position"
         case syncIsServer = "sync.isServer"
         case syncServerHost = "sync.serverHost"
         case syncPort = "sync.port"
@@ -212,6 +221,10 @@ final class MediaPlayerViewModel: ObservableObject {
         showSubtitlesIfAvailable = defaults.object(forKey: namespacedKey(.subtitlesEnabled)) as? Bool ?? false
         subtitleFontPointSize = CGFloat(defaults.object(forKey: namespacedKey(.subtitleFontSize)) as? Int ?? 28)
         subtitleIsBold = defaults.object(forKey: namespacedKey(.subtitleBold)) as? Bool ?? false
+        if let position = defaults.array(forKey: namespacedKey(.subtitlePosition)) as? [Double],
+           position.count == 2, position.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
+            subtitlePosition = CGPoint(x: position[0], y: position[1])
+        }
 
         isThisDeviceTheSyncServer = defaults.object(forKey: namespacedKey(.syncIsServer)) as? Bool ?? false
         syncServerHostnameOrIpAddress = defaults.string(forKey: namespacedKey(.syncServerHost)) ?? ""
@@ -1540,11 +1553,55 @@ struct SubtitleOverlayView: View {
     let text: String
     let fontSize: CGFloat
     let isBold: Bool
+    @Binding var position: CGPoint
+    @State private var bubbleSize: CGSize = .zero
+    @GestureState private var dragTranslation: CGSize = .zero
 
     var body: some View {
-        VStack { Spacer() ; subtitleBubble ; Spacer().frame(height: 20) }
-            .padding(.horizontal, 40)
-            .allowsHitTesting(false)
+        GeometryReader { geometry in
+            let travel = CGSize(width: max(0, geometry.size.width - bubbleSize.width),
+                                height: max(0, geometry.size.height - bubbleSize.height))
+            ZStack {
+                if !text.isEmpty {
+                    subtitleBubble
+                        .background {
+                            GeometryReader { bubble in
+                                Color.clear.preference(key: SubtitleSizePreference.self,
+                                                       value: [text: bubble.size])
+                            }
+                        }
+                        .id(text)
+                        .transition(.opacity)
+                }
+            }
+            .onPreferenceChange(SubtitleSizePreference.self) { sizes in
+                if let size = sizes[text] { bubbleSize = size }
+            }
+            .animation(.easeInOut(duration: 0.2), value: text)
+            .position(x: bubbleSize.width / 2 + clamped(position.x * travel.width + dragTranslation.width, to: travel.width),
+                      y: bubbleSize.height / 2 + clamped(position.y * travel.height + dragTranslation.height, to: travel.height))
+#if !os(tvOS)
+            .gesture(
+                DragGesture(coordinateSpace: .named("subtitlePosition"))
+                    .updating($dragTranslation) { value, translation, _ in
+                        translation = value.translation
+                    }
+                    .onEnded { value in
+                        position = CGPoint(
+                            x: travel.width > 0 ? clamped(position.x + value.translation.width / travel.width, to: 1) : position.x,
+                            y: travel.height > 0 ? clamped(position.y + value.translation.height / travel.height, to: 1) : position.y
+                        )
+                    }
+            )
+#endif
+        }
+        .coordinateSpace(name: "subtitlePosition")
+        .padding(.vertical, 20)
+        .padding(.horizontal, 40)
+    }
+
+    private func clamped(_ value: CGFloat, to maximum: CGFloat) -> CGFloat {
+        min(maximum, max(0, value))
     }
 
     private var subtitleBubble: some View {
@@ -1555,8 +1612,14 @@ struct SubtitleOverlayView: View {
             .padding(12)
             .background(.black.opacity(0.6))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .opacity(text.isEmpty ? 0 : 1)
-            .animation(.easeInOut(duration: 0.2), value: text)
+    }
+}
+
+private struct SubtitleSizePreference: PreferenceKey {
+    static let defaultValue: [String: CGSize] = [:]
+
+    static func reduce(value: inout [String: CGSize], nextValue: () -> [String: CGSize]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
@@ -1578,12 +1641,6 @@ extension MediaPlayerRootView {
                 .ignoresSafeArea()
 #endif
 
-            if viewModel.showSubtitlesIfAvailable {
-                SubtitleOverlayView(text: viewModel.currentlyVisibleSubtitleText,
-                                    fontSize: viewModel.subtitleFontPointSize,
-                                    isBold: viewModel.subtitleIsBold)
-            }
-
 #if !os(macOS)
             if !viewModel.videoControlsEnabled {
                 LongPressSettingsOverlay(
@@ -1594,6 +1651,12 @@ extension MediaPlayerRootView {
                 .ignoresSafeArea()
             }
 #endif
+            if viewModel.showSubtitlesIfAvailable {
+                SubtitleOverlayView(text: viewModel.currentlyVisibleSubtitleText,
+                                    fontSize: viewModel.subtitleFontPointSize,
+                                    isBold: viewModel.subtitleIsBold,
+                                    position: $viewModel.subtitlePosition)
+            }
         }
         .contentShape(Rectangle())
         .onLongPressGesture {
@@ -1636,6 +1699,14 @@ struct SyncAndSubtitleSettings: View {
 #endif
 
             Toggle("Bold text", isOn: $viewModel.subtitleIsBold)
+            Button("Reset subtitle position") {
+                viewModel.resetSubtitlePosition()
+            }
+#if !os(tvOS)
+            Text("Drag subtitles on the video to reposition them. Their position is saved automatically.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+#endif
         }
 
         Section("Multi-device Sync") {
